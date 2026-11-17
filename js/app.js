@@ -15,7 +15,7 @@ const PREFS_KEY = 'tidemark.prefs';
 const prefs = { view: 'active', sort: 'deadline', theme: 'system', category: null };
 try { Object.assign(prefs, JSON.parse(localStorage.getItem(PREFS_KEY) || '{}')); } catch { /* defaults */ }
 const savePrefs = () => localStorage.setItem(PREFS_KEY, JSON.stringify(prefs));
-const ui = { search: '', sel: null, draft: null, push: 'off', pushStep: null, pushError: null, colorFor: null, installEvent: null, authMode: 'signin', forceAuth: false };
+const ui = { search: '', sel: null, draft: null, push: 'off', pushStep: null, pushError: null, colorFor: null, defaultsFor: null, installEvent: null, authMode: 'signin', forceAuth: false };
 
 const VIEWS = { active: 'To do', today: 'Due today', started: 'Started', completed: 'Completed', notes: 'Notes' };
 const STATUS = { todo: 'To do', started: 'Started', completed: 'Completed' };
@@ -104,6 +104,64 @@ function remindAt(t) {
   if (t.due_all_day) base.setHours(9, 0, 0, 0);
   return new Date(base.getTime() - t.remind_offset * 60000).toISOString();
 }
+// ---------- category defaults ----------
+
+const WEEKDAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+const WEEK_ORDER = [1, 2, 3, 4, 5, 6, 0]; // menus list Monday first
+const clockLabel = (hhmm) => { const [h, m] = hhmm.split(':').map(Number); return fmtTime.format(new Date(2000, 0, 1, h, m)); };
+
+// The deadline a category gives a task created now, as [date, time] for setDue(), or null.
+function categoryDue(c, now = new Date()) {
+  const d = new Date(now);
+  if (c.def_due_kind === 'days' && c.def_due_days != null) {
+    d.setDate(d.getDate() + c.def_due_days);
+  } else if (c.def_due_kind === 'weekday' && c.def_due_weekday != null) {
+    let add = (c.def_due_weekday - d.getDay() + 7) % 7;
+    if (add === 0 && c.def_due_time) { // today is that weekday: use today only if the time is still ahead
+      const [h, m] = c.def_due_time.split(':').map(Number);
+      if (h * 60 + m <= now.getHours() * 60 + now.getMinutes()) add = 7;
+    }
+    d.setDate(d.getDate() + add);
+  } else return null;
+  return [localDate(d), c.def_due_time || ''];
+}
+
+// Gives a task its category's defaults for every setting it doesn't have yet. Returns what was filled in.
+function applyCategoryDefaults(t, categoryId) {
+  const c = category(categoryId);
+  const filled = [];
+  if (!c) return filled;
+  if (c.def_priority && !t.priority) { t.priority = c.def_priority; filled.push('priority'); }
+  if (c.def_remind_offset != null && t.remind_offset == null) { t.remind_offset = c.def_remind_offset; filled.push('reminder'); }
+  const due = !t.due_at && categoryDue(c);
+  if (due) { setDue(t, ...due); filled.push('deadline'); }
+  t.remind_at = remindAt(t);
+  return filled;
+}
+// In the new-task form, settings that came from a category are swapped when the category changes,
+// unless the user has set them by hand since.
+function touched(t, what) { if (t._auto) t._auto = t._auto.filter((x) => x !== what); }
+function swapDraftCategory(t) {
+  for (const what of t._auto || []) {
+    if (what === 'priority') t.priority = 0;
+    if (what === 'reminder') t.remind_offset = null;
+    if (what === 'deadline') setDue(t, '', '');
+  }
+  t._auto = applyCategoryDefaults(t, t.category_id);
+}
+
+function defaultsSummary(c) {
+  const parts = [];
+  if (c.def_priority) parts.push(`${PRIORITY[c.def_priority].toLowerCase()} priority`);
+  const at = c.def_due_time ? ` at ${clockLabel(c.def_due_time)}` : '';
+  if (c.def_due_kind === 'days' && c.def_due_days != null) {
+    parts.push(`due ${c.def_due_days === 0 ? 'the same day' : c.def_due_days === 1 ? '1 day later' : `${c.def_due_days} days later`}${at}`);
+  }
+  if (c.def_due_kind === 'weekday' && c.def_due_weekday != null) parts.push(`due the next ${WEEKDAYS[c.def_due_weekday]}${at}`);
+  if (c.def_remind_offset != null) parts.push(`reminder ${(REMINDERS.find(([v]) => v === c.def_remind_offset)?.[1] || '').toLowerCase()}`);
+  return parts.length ? `New tasks: ${parts.join(', ')}.` : '';
+}
+
 function setStatus(t, status) {
   t.status = status;
   const now = store.nowIso();
@@ -347,6 +405,7 @@ function startDraft(fields) {
   if (ui.sel?.draft) discardDraft(false);
   flushSave();
   ui.draft = { ...store.DEFAULTS.tasks(), id: store.uid(), created_at: store.nowIso(), deleted: false, ...fields };
+  ui.draft._auto = applyCategoryDefaults(ui.draft, ui.draft.category_id);
   ui.sel = { kind: 'tasks', id: ui.draft.id, draft: true };
   renderPane(); renderList();
   const title = $('.title-input', el.pane);
@@ -361,7 +420,8 @@ function createDraft() {
     return;
   }
   ui.draft = null; ui.sel = null;
-  store.create('tasks', { ...d, created_at: store.nowIso() });
+  const { _auto, ...fields } = d;
+  store.create('tasks', { ...fields, created_at: store.nowIso() });
   renderPane(); renderList();
   toast('Task created.');
 }
@@ -474,7 +534,7 @@ function paneState(t) {
   $('[data-field="remind"]', el.pane).disabled = !hasDue;
 
   const hint = $('[data-hint="remind"]', el.pane);
-  if (!hasDue) hint.textContent = 'Set a deadline first.';
+  if (!hasDue) hint.textContent = t.remind_offset != null ? 'The reminder starts once the task has a deadline.' : 'Set a deadline first.';
   else if (t.remind_offset == null) hint.textContent = '';
   else if (ui.push !== 'on') hint.textContent = 'Notifications are off on this device. Turn them on in Settings.';
   else if (t.status === 'completed') hint.textContent = 'Completed tasks do not send reminders.';
@@ -574,13 +634,15 @@ function renderSettings() {
       <section><h3>Account and sync</h3>${account}</section>
       <section><h3>Reminders</h3><p>${pushText}</p><div class="row">${pushButtons}</div>${ui.pushError ? `<p class="error-text" role="alert">${esc(ui.pushError)}</p>` : ''}</section>
       <section><h3>Categories</h3>
-        ${cats.length ? `<p class="hint">Click a colour dot to change it.</p><ul class="cat-edit">${cats.map((c) => `
+        ${cats.length ? `<p class="hint">Click a colour dot to change it. Use “Defaults” to give new tasks in a category a priority, deadline and reminder.</p><ul class="cat-edit">${cats.map((c) => `
           <li data-cat-id="${c.id}">
             <div class="cat-row">
               <button class="swatch" data-act="cat-color" style="background:${esc(c.color)}" aria-expanded="${ui.colorFor === c.id}" aria-label="Choose colour for ${esc(c.name)}" title="Choose colour"></button>
               <input type="text" data-cat-name value="${esc(c.name)}" aria-label="Category name" maxlength="40">
+              <button class="btn small" data-act="cat-defaults" aria-expanded="${ui.defaultsFor === c.id}">Defaults</button>
               <button class="icon small danger" data-act="cat-delete" aria-label="Delete category ${esc(c.name)}">${ICON.trash}</button>
             </div>
+            ${ui.defaultsFor === c.id ? defaultsPanel(c) : defaultsSummary(c) ? `<p class="hint cat-summary">${esc(defaultsSummary(c))}</p>` : ''}
             ${ui.colorFor === c.id ? `
             <div class="palette" role="group" aria-label="Colour for ${esc(c.name)}">
               ${COLORS.map((col) => `<button class="swatch small" data-act="cat-set-color" data-value="${col}" style="background:${col}" aria-pressed="${col.toUpperCase() === c.color.toUpperCase()}" aria-label="Colour ${col}"></button>`).join('')}
@@ -602,9 +664,48 @@ function renderSettings() {
     </div>`;
 }
 
+function defaultsPanel(c) {
+  const kind = c.def_due_kind || '';
+  return `
+    <div class="cat-defaults" role="group" aria-label="Defaults for ${esc(c.name)}">
+      <p class="hint">New tasks in ${esc(c.name)} start with these. A task moved into ${esc(c.name)} gets the ones it doesn't have yet; nothing you set yourself is replaced.</p>
+      <div class="field"><span class="label" id="dp-${c.id}">Priority</span>
+        <div class="seg small" role="group" aria-labelledby="dp-${c.id}">
+          ${PRIORITY.map((l, i) => `<button data-act="cat-def-priority" data-value="${i}" aria-pressed="${(c.def_priority || 0) === i}">${l}</button>`).join('')}
+        </div>
+      </div>
+      <label class="field"><span class="label">Deadline</span>
+        <select data-cat-def="kind">
+          <option value="" ${kind === '' ? 'selected' : ''}>No default deadline</option>
+          <option value="days" ${kind === 'days' ? 'selected' : ''}>A number of days after the task is made</option>
+          <option value="weekday" ${kind === 'weekday' ? 'selected' : ''}>The next chosen day of the week</option>
+        </select>
+      </label>
+      ${kind === 'days' ? `
+      <label class="field"><span class="label">Days after the task is made (0 = the same day)</span>
+        <input type="number" inputmode="numeric" min="0" max="365" step="1" data-cat-def="days" value="${c.def_due_days ?? 1}">
+      </label>` : ''}
+      ${kind === 'weekday' ? `
+      <label class="field"><span class="label">Day of the week</span>
+        <select data-cat-def="weekday">${WEEK_ORDER.map((d) => `<option value="${d}" ${c.def_due_weekday === d ? 'selected' : ''}>${WEEKDAYS[d]}</option>`).join('')}</select>
+      </label>` : ''}
+      ${kind ? `
+      <div class="field"><span class="label">Time (optional)</span>
+        <div class="row"><input type="time" data-cat-def="time" aria-label="Deadline time" value="${esc(c.def_due_time || '')}">${c.def_due_time ? '<button class="link" data-act="cat-def-no-time">No time</button>' : ''}</div>
+      </div>` : ''}
+      <label class="field"><span class="label">Reminder</span>
+        <select data-cat-def="remind">
+          <option value="">No reminder</option>
+          ${REMINDERS.map(([v, l]) => `<option value="${v}" ${c.def_remind_offset === v ? 'selected' : ''}>${l}</option>`).join('')}
+        </select>
+      </label>
+      ${defaultsSummary(c) ? `<p class="hint">${esc(defaultsSummary(c))}</p>` : ''}
+    </div>`;
+}
+
 // Background refresh of an open settings dialog, skipped while a name is being typed in it.
 function refreshSettings() {
-  if (el.settings.open && !document.activeElement?.matches?.('#settings input[type="text"], #settings input[type="color"]')) renderSettings();
+  if (el.settings.open && !document.activeElement?.matches?.('#settings input, #settings select')) renderSettings();
 }
 
 // ---------- sign-in screen ----------
@@ -715,9 +816,9 @@ const ACTIONS = {
     if (t.status === 'completed') toast('Completed.', { label: 'Undo', run: () => { setStatus(t, before); store.save('tasks', t); } });
   },
   status: (b) => { const t = selected(); setStatus(t, b.dataset.value); commit('tasks', t); paneState(t); },
-  priority: (b) => { const t = selected(); t.priority = Number(b.dataset.value); commit('tasks', t); paneState(t); },
+  priority: (b) => { const t = selected(); touched(t, 'priority'); t.priority = Number(b.dataset.value); commit('tasks', t); paneState(t); },
   'clear-due': () => {
-    const t = selected(); setDue(t, '', '');
+    const t = selected(); touched(t, 'deadline'); setDue(t, '', '');
     $('[data-field="due-date"]', el.pane).value = ''; $('[data-field="due-time"]', el.pane).value = '';
     commit('tasks', t); paneState(t);
   },
@@ -772,6 +873,19 @@ const ACTIONS = {
     ui.colorFor = ui.colorFor === id ? null : id;
     renderSettings();
   },
+  'cat-defaults': (b) => {
+    const id = b.closest('[data-cat-id]').dataset.catId;
+    ui.defaultsFor = ui.defaultsFor === id ? null : id;
+    renderSettings();
+  },
+  'cat-def-priority': (b) => {
+    const c = store.get('categories', b.closest('[data-cat-id]').dataset.catId);
+    c.def_priority = Number(b.dataset.value) || null; store.save('categories', c); renderSettings();
+  },
+  'cat-def-no-time': (b) => {
+    const c = store.get('categories', b.closest('[data-cat-id]').dataset.catId);
+    c.def_due_time = null; store.save('categories', c); renderSettings();
+  },
   'cat-set-color': (b) => {
     const c = store.get('categories', b.closest('[data-cat-id]').dataset.catId);
     c.color = b.dataset.value; store.save('categories', c); renderSettings();
@@ -825,6 +939,7 @@ document.addEventListener('submit', (e) => {
     const fields = { title: value, category_id: prefs.category };
     if (prefs.view === 'today') setDue(fields, localDate(new Date()), '');
     if (prefs.view === 'started') setStatus(fields, 'started');
+    applyCategoryDefaults(fields, fields.category_id);
     store.create('tasks', fields);
     input.value = '';
   } else if (form.dataset.form === 'add-category') {
@@ -854,6 +969,31 @@ function onField(e) {
     if (e.type === 'change') { c.color = target.value.toUpperCase(); store.save('categories', c); }
     return;
   }
+  if (target.matches('[data-cat-def]')) {
+    const c = store.get('categories', target.closest('[data-cat-id]').dataset.catId);
+    const v = target.value;
+    switch (target.dataset.catDef) {
+      case 'kind':
+        c.def_due_kind = v || null;
+        if (v === 'days') c.def_due_days ??= 1;
+        if (v === 'weekday') c.def_due_weekday ??= 5;
+        break;
+      case 'days': {
+        const n = Math.round(Number(v));
+        if (v === '' || !Number.isFinite(n)) return;           // wait until a number is typed
+        c.def_due_days = Math.min(365, Math.max(0, n));
+        if (e.type !== 'change') { saveSoon('categories', c.id); return; }
+        break;
+      }
+      case 'weekday': c.def_due_weekday = Number(v); break;
+      case 'time': if (e.type !== 'change') return; c.def_due_time = v || null; break;
+      case 'remind': c.def_remind_offset = v === '' ? null : Number(v); break;
+    }
+    flushSave();
+    store.save('categories', c);
+    renderSettings();
+    return;
+  }
   if (target.matches('[data-cat-name]')) {
     const c = store.get('categories', target.closest('[data-cat-id]').dataset.catId);
     c.name = target.value.trim() || c.name;
@@ -879,20 +1019,30 @@ function onField(e) {
     case 'title': row.title = target.value.replace(/\n/g, ' '); grow(target); saveSoon(kind, row.id); break;
     case 'notes': row.notes = target.value; grow(target); saveSoon(kind, row.id); break;
     case 'body': row.body = target.value; saveSoon(kind, row.id); break;
-    case 'category': row.category_id = target.value || null; commit(kind, row); break;
+    case 'category': {
+      row.category_id = target.value || null;
+      if (kind !== 'tasks') { commit(kind, row); break; }
+      if (isDraft(row)) { swapDraftCategory(row); renderPane(); break; }
+      const filled = applyCategoryDefaults(row, row.category_id);
+      commit(kind, row);
+      if (filled.length) { renderPane(); toast(`Filled in from ${category(row.category_id).name}: ${filled.join(', ')}.`); }
+      break;
+    }
     case 'remind':
+      touched(row, 'reminder');
       row.remind_offset = target.value === '' ? null : Number(target.value);
       row.remind_at = remindAt(row);
       commit(kind, row); paneState(row); break;
     case 'due-date':
     case 'due-time':
       if (e.type !== 'change') return;
+      touched(row, 'deadline');
       setDue(row, $('[data-field="due-date"]', el.pane).value, $('[data-field="due-time"]', el.pane).value);
       commit(kind, row); paneState(row); break;
   }
 }
 document.addEventListener('input', onField);
-document.addEventListener('change', (e) => { if (/^(date|time|color)$/.test(e.target.type)) onField(e); });
+document.addEventListener('change', (e) => { if (/^(date|time|color|number)$/.test(e.target.type)) onField(e); });
 
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape' && !el.settings.open) {
@@ -915,7 +1065,7 @@ async function importFile(file) {
 }
 
 $('#auth-form').addEventListener('submit', submitAuth);
-el.settings.addEventListener('close', () => { flushSave(); ui.colorFor = null; ui.pushError = null; });
+el.settings.addEventListener('close', () => { flushSave(); ui.colorFor = null; ui.defaultsFor = null; ui.pushError = null; });
 
 // Data changed (here or on another device): redraw what could be affected.
 store.bus.addEventListener('change', (e) => {

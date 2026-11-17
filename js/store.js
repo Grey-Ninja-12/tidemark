@@ -18,7 +18,11 @@ export const DEFAULTS = {
     category_id: null, subtasks: [], started_at: null, completed_at: null,
   }),
   notes: () => ({ title: '', body: '', category_id: null, pinned: false }),
-  categories: () => ({ name: '', color: '#0B6B78' }),
+  categories: () => ({
+    name: '', color: '#0B6B78',
+    // Defaults for tasks in this category. Deadline: "days" = N days after creation, "weekday" = next given weekday (0 = Sunday).
+    def_priority: null, def_due_kind: null, def_due_days: null, def_due_weekday: null, def_due_time: null, def_remind_offset: null,
+  }),
 };
 
 export async function load() {
