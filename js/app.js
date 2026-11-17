@@ -15,14 +15,23 @@ const PREFS_KEY = 'tidemark.prefs';
 const prefs = { view: 'active', sort: 'deadline', theme: 'system', category: null };
 try { Object.assign(prefs, JSON.parse(localStorage.getItem(PREFS_KEY) || '{}')); } catch { /* defaults */ }
 const savePrefs = () => localStorage.setItem(PREFS_KEY, JSON.stringify(prefs));
-const ui = { search: '', sel: null, push: 'off', installEvent: null, authMode: 'signin', forceAuth: false };
+const ui = { search: '', sel: null, draft: null, push: 'off', pushStep: null, pushError: null, colorFor: null, installEvent: null, authMode: 'signin', forceAuth: false };
 
 const VIEWS = { active: 'To do', today: 'Due today', started: 'Started', completed: 'Completed', notes: 'Notes' };
 const STATUS = { todo: 'To do', started: 'Started', completed: 'Completed' };
 const NEXT_STATUS = { todo: 'started', started: 'completed', completed: 'todo' };
 const PRIORITY = ['None', 'Low', 'Medium', 'High'];
 const REMINDERS = [[0, 'At the deadline'], [10, '10 minutes before'], [60, '1 hour before'], [1440, '1 day before'], [2880, '2 days before'], [10080, '1 week before']];
-const COLORS = ['#0B6B78', '#3D5AA8', '#7A4FA3', '#B8436B', '#B8322A', '#A8690A', '#4E7D2B', '#5A6E78'];
+const COLORS = ['#0B6B78', '#2F7FB5', '#3D5AA8', '#7A4FA3', '#B04A9C', '#B8436B', '#B8322A', '#C2601A', '#A8690A', '#7D8A1E', '#4E7D2B', '#5A6E78'];
+// A random colour that stays readable on both light and dark backgrounds.
+function randomColor(not) {
+  for (;;) {
+    const h = Math.floor(Math.random() * 360), s = 0.5 + Math.random() * 0.2, l = 0.38 + Math.random() * 0.1;
+    const f = (n) => { const k = (n + h / 30) % 12; const c = l - s * Math.min(l, 1 - l) * Math.max(-1, Math.min(k - 3, 9 - k, 1)); return Math.round(c * 255).toString(16).padStart(2, '0'); };
+    const hex = `#${f(0)}${f(8)}${f(4)}`.toUpperCase();
+    if (hex !== not) return hex;
+  }
+}
 const GROUPS = [['overdue', 'Overdue'], ['today', 'Today'], ['tomorrow', 'Tomorrow'], ['week', 'Next 7 days'], ['later', 'Later'], ['none', 'No deadline']];
 
 const ICON = {
@@ -212,6 +221,7 @@ function renderBar() {
         : `<form class="quick" data-form="quick-add">
              <input name="title" placeholder="Add a task" aria-label="Add a task" autocomplete="off" maxlength="300" enterkeyhint="done">
              <button class="btn primary">Add</button>
+             <button type="button" class="btn" data-act="new-task-details">Add with details</button>
            </form>`}
       <label class="search">${ICON.search}<input type="search" data-input="search" placeholder="Search" aria-label="Search" value="${esc(ui.search)}"></label>
       ${notes || prefs.view === 'completed' ? '' : `
@@ -300,7 +310,10 @@ const renderList = () => (prefs.view === 'notes' ? renderNotes() : renderTasks()
 
 // ---------- detail pane ----------
 
-const selected = () => (ui.sel ? store.get(ui.sel.kind, ui.sel.id) : null);
+const selected = () => (ui.sel?.draft ? ui.draft : ui.sel ? store.get(ui.sel.kind, ui.sel.id) : null);
+const isDraft = (row) => Boolean(row) && row === ui.draft;
+// Saves an edit made in the detail pane. A task that has not been created yet only lives in ui.draft.
+function commit(kind, row) { if (!isDraft(row)) store.save(kind, row); }
 const categoryOptions = (current) =>
   `<option value="">No category</option>` +
   store.list('categories').sort((a, b) => a.name.localeCompare(b.name))
@@ -309,6 +322,7 @@ const categoryOptions = (current) =>
 let pendingSave = null;
 const saveTimer = debounce(() => flushSave(), 350);
 function saveSoon(kind, id) {
+  if (ui.draft && id === ui.draft.id) return;
   if (pendingSave && pendingSave.id !== id) flushSave();
   pendingSave = { kind, id };
   saveTimer();
@@ -322,12 +336,47 @@ function flushSave() {
 }
 
 function open(kind, id) {
+  if (ui.sel?.draft) discardDraft();
   flushSave();
   ui.sel = { kind, id };
   renderPane();
   renderList();
 }
+// The "Add with details" form: a task that is only saved when "Create task" is pressed.
+function startDraft(fields) {
+  if (ui.sel?.draft) discardDraft(false);
+  flushSave();
+  ui.draft = { ...store.DEFAULTS.tasks(), id: store.uid(), created_at: store.nowIso(), deleted: false, ...fields };
+  ui.sel = { kind: 'tasks', id: ui.draft.id, draft: true };
+  renderPane(); renderList();
+  const title = $('.title-input', el.pane);
+  if (!ui.draft.title) title?.focus();
+}
+function createDraft() {
+  const d = ui.draft;
+  if (!d) return;
+  if (!d.title.trim()) {
+    $('.title-input', el.pane)?.focus();
+    toast('Give the task a title first.');
+    return;
+  }
+  ui.draft = null; ui.sel = null;
+  store.create('tasks', { ...d, created_at: store.nowIso() });
+  renderPane(); renderList();
+  toast('Task created.');
+}
+function discardDraft(offerUndo = true) {
+  const d = ui.draft;
+  ui.draft = null; ui.sel = null;
+  renderPane(); renderList();
+  const hasContent = d && (d.title.trim() || d.notes.trim() || d.subtasks.length || d.due_at);
+  if (offerUndo && hasContent) {
+    toast('New task discarded.', { label: 'Undo', run: () => { ui.draft = d; ui.sel = { kind: 'tasks', id: d.id, draft: true }; renderPane(); } });
+  }
+}
+
 function closePane() {
+  if (ui.sel?.draft) { discardDraft(); return; }
   flushSave();
   const row = selected();
   // An item opened and left completely blank was a false start: don't keep it.
@@ -350,17 +399,18 @@ function renderPane() {
   if (ui.sel.kind === 'tasks') paneState(row);
 }
 
-const paneHead = (what) => `
+const paneHead = (what, draft = false) => `
   <div class="pane-head">
-    <button class="icon" data-act="close" aria-label="Close">${ICON.back}</button>
+    <button class="icon" data-act="close" aria-label="${draft ? 'Discard new task' : 'Close'}">${ICON.back}</button>
     <span class="pane-kind">${what}</span>
-    <button class="icon danger" data-act="delete" aria-label="Delete ${what.toLowerCase()}" title="Delete">${ICON.trash}</button>
+    ${draft ? '' : `<button class="icon danger" data-act="delete" aria-label="Delete ${what.toLowerCase()}" title="Delete">${ICON.trash}</button>`}
   </div>`;
 
 function taskPane(t) {
   const d = t.due_at ? new Date(t.due_at) : null;
+  const draft = isDraft(t);
   return `
-    ${paneHead('Task')}
+    ${paneHead(draft ? 'New task' : 'Task', draft)}
     <div class="pane-body">
       <textarea class="title-input" data-field="title" data-grow rows="1" placeholder="Task title" aria-label="Task title" maxlength="300">${esc(t.title)}</textarea>
 
@@ -406,7 +456,11 @@ function taskPane(t) {
       </label>
 
       <p class="stamps" data-stamps></p>
-    </div>`;
+    </div>
+    ${draft ? `<div class="pane-foot">
+      <button class="btn" data-act="close">Discard</button>
+      <button class="btn primary" data-act="create-draft">Create task</button>
+    </div>` : ''}`;
 }
 
 // Updates the parts of the task pane that depend on other fields, without rebuilding the
@@ -427,6 +481,7 @@ function paneState(t) {
   else if (new Date(t.remind_at) < new Date()) hint.textContent = 'That time has already passed.';
   else hint.textContent = `You will be reminded ${dayDiff(t.remind_at) === 0 ? 'today' : 'on ' + shortDate(t.remind_at)} at ${fmtTime.format(new Date(t.remind_at))}.` + (t.due_all_day ? ' Deadlines without a time count from 09:00.' : '');
 
+  if (isDraft(t)) { $('[data-stamps]', el.pane).textContent = 'Nothing is saved until you choose “Create task”.'; renderSubs(t); return; }
   const stamps = [`Created ${shortDate(t.created_at)}`];
   if (t.started_at) stamps.push(`started ${shortDate(t.started_at)}`);
   if (t.completed_at) stamps.push(`completed ${shortDate(t.completed_at)}`);
@@ -507,7 +562,8 @@ function renderSettings() {
     off: 'Get a notification on this device when a reminder is due, even if Tidemark is closed.',
     on: 'Reminders are on for this device.',
   }[ui.push];
-  const pushButtons = ui.push === 'off' ? `<button class="btn primary" data-act="push-on" ${sync.user ? '' : 'disabled'}>Turn on reminders</button>`
+  const pushButtons = ui.pushStep ? `<button class="btn primary" disabled>${esc(ui.pushStep)}</button>`
+    : ui.push === 'off' ? `<button class="btn primary" data-act="push-on" ${sync.user ? '' : 'disabled'}>Turn on reminders</button>`
     : ui.push === 'on' ? `<button class="btn" data-act="push-test">Send a test reminder</button><button class="btn" data-act="push-off">Turn off</button>` : '';
 
   const cats = store.list('categories').sort((a, b) => a.name.localeCompare(b.name));
@@ -516,13 +572,21 @@ function renderSettings() {
     <div class="dialog-head"><h2 id="settings-title">Settings</h2><button class="icon" data-act="close-settings" aria-label="Close settings">${ICON.close}</button></div>
     <div class="dialog-body">
       <section><h3>Account and sync</h3>${account}</section>
-      <section><h3>Reminders</h3><p>${pushText}</p><div class="row">${pushButtons}</div></section>
+      <section><h3>Reminders</h3><p>${pushText}</p><div class="row">${pushButtons}</div>${ui.pushError ? `<p class="error-text" role="alert">${esc(ui.pushError)}</p>` : ''}</section>
       <section><h3>Categories</h3>
-        ${cats.length ? `<ul class="cat-edit">${cats.map((c) => `
+        ${cats.length ? `<p class="hint">Click a colour dot to change it.</p><ul class="cat-edit">${cats.map((c) => `
           <li data-cat-id="${c.id}">
-            <button class="swatch" data-act="cat-color" style="background:${esc(c.color)}" aria-label="Change colour of ${esc(c.name)}" title="Change colour"></button>
-            <input type="text" data-cat-name value="${esc(c.name)}" aria-label="Category name" maxlength="40">
-            <button class="icon small danger" data-act="cat-delete" aria-label="Delete category ${esc(c.name)}">${ICON.trash}</button>
+            <div class="cat-row">
+              <button class="swatch" data-act="cat-color" style="background:${esc(c.color)}" aria-expanded="${ui.colorFor === c.id}" aria-label="Choose colour for ${esc(c.name)}" title="Choose colour"></button>
+              <input type="text" data-cat-name value="${esc(c.name)}" aria-label="Category name" maxlength="40">
+              <button class="icon small danger" data-act="cat-delete" aria-label="Delete category ${esc(c.name)}">${ICON.trash}</button>
+            </div>
+            ${ui.colorFor === c.id ? `
+            <div class="palette" role="group" aria-label="Colour for ${esc(c.name)}">
+              ${COLORS.map((col) => `<button class="swatch small" data-act="cat-set-color" data-value="${col}" style="background:${col}" aria-pressed="${col.toUpperCase() === c.color.toUpperCase()}" aria-label="Colour ${col}"></button>`).join('')}
+              <label class="btn small">Custom<input type="color" data-cat-custom value="${esc(c.color)}" class="sr"></label>
+              <button class="btn small" data-act="cat-random">Random</button>
+            </div>` : ''}
           </li>`).join('')}</ul>` : '<p class="hint">No categories yet. Add one from the menu.</p>'}
       </section>
       <section><h3>Appearance</h3>
@@ -540,7 +604,7 @@ function renderSettings() {
 
 // Background refresh of an open settings dialog, skipped while a name is being typed in it.
 function refreshSettings() {
-  if (el.settings.open && !document.activeElement?.matches?.('#settings input[type="text"]')) renderSettings();
+  if (el.settings.open && !document.activeElement?.matches?.('#settings input[type="text"], #settings input[type="color"]')) renderSettings();
 }
 
 // ---------- sign-in screen ----------
@@ -612,6 +676,7 @@ async function submitAuth(e) {
 function renderAll() { renderNav(); renderBar(); renderList(); renderPane(); }
 
 function setView(view) {
+  if (ui.sel?.draft && view === 'notes') discardDraft();
   flushSave();
   prefs.view = view; savePrefs();
   if (ui.sel && (ui.sel.kind === 'notes') !== (view === 'notes')) ui.sel = null;
@@ -627,6 +692,15 @@ const ACTIONS = {
 
   open: (b) => open('tasks', b.closest('[data-id]').dataset.id),
   'open-note': (b) => open('notes', b.closest('[data-id]').dataset.id),
+  'new-task-details': () => {
+    const input = $('.quick input');
+    const fields = { title: input?.value.trim() || '', category_id: prefs.category };
+    if (prefs.view === 'today') setDue(fields, localDate(new Date()), '');
+    if (prefs.view === 'started') setStatus(fields, 'started');
+    if (input) input.value = '';
+    startDraft(fields);
+  },
+  'create-draft': () => createDraft(),
   'new-note': () => {
     const n = store.create('notes', { category_id: prefs.category });
     open('notes', n.id);
@@ -640,17 +714,17 @@ const ACTIONS = {
     store.save('tasks', t);
     if (t.status === 'completed') toast('Completed.', { label: 'Undo', run: () => { setStatus(t, before); store.save('tasks', t); } });
   },
-  status: (b) => { const t = selected(); setStatus(t, b.dataset.value); store.save('tasks', t); paneState(t); },
-  priority: (b) => { const t = selected(); t.priority = Number(b.dataset.value); store.save('tasks', t); paneState(t); },
+  status: (b) => { const t = selected(); setStatus(t, b.dataset.value); commit('tasks', t); paneState(t); },
+  priority: (b) => { const t = selected(); t.priority = Number(b.dataset.value); commit('tasks', t); paneState(t); },
   'clear-due': () => {
     const t = selected(); setDue(t, '', '');
     $('[data-field="due-date"]', el.pane).value = ''; $('[data-field="due-time"]', el.pane).value = '';
-    store.save('tasks', t); paneState(t);
+    commit('tasks', t); paneState(t);
   },
   'remove-sub': (b) => {
     const t = selected(); const id = b.closest('.sub').dataset.sub;
     t.subtasks = t.subtasks.filter((s) => s.id !== id);
-    store.save('tasks', t); renderSubs(t);
+    commit('tasks', t); renderSubs(t);
   },
   pin: () => { const n = selected(); n.pinned = !n.pinned; store.save('notes', n); renderPane(); },
   delete: () => {
@@ -671,8 +745,14 @@ const ACTIONS = {
   },
   'sign-in-again': () => { el.settings.close(); ui.forceAuth = true; ui.authMode = 'signin'; showScreen(); },
   'push-on': async () => {
-    try { await sync.enablePush(); toast('Reminders are on for this device.'); }
-    catch (e) { toast(e.message); }
+    if (ui.pushStep) return;
+    ui.pushError = null;
+    ui.pushStep = 'Starting…'; renderSettings();
+    try {
+      await sync.enablePush((step) => { ui.pushStep = step; renderSettings(); });
+      toast('Reminders are on for this device.');
+    } catch (e) { ui.pushError = e?.message || String(e); }
+    ui.pushStep = null;
     openSettings();
   },
   'push-off': async () => {
@@ -688,9 +768,17 @@ const ACTIONS = {
     } catch (e) { toast('Test failed: ' + e.message); }
   },
   'cat-color': (b) => {
+    const id = b.closest('[data-cat-id]').dataset.catId;
+    ui.colorFor = ui.colorFor === id ? null : id;
+    renderSettings();
+  },
+  'cat-set-color': (b) => {
     const c = store.get('categories', b.closest('[data-cat-id]').dataset.catId);
-    c.color = COLORS[(COLORS.indexOf(c.color) + 1) % COLORS.length];
-    store.save('categories', c); renderSettings();
+    c.color = b.dataset.value; store.save('categories', c); renderSettings();
+  },
+  'cat-random': (b) => {
+    const c = store.get('categories', b.closest('[data-cat-id]').dataset.catId);
+    c.color = randomColor(c.color); store.save('categories', c); renderSettings();
   },
   'cat-delete': (b) => {
     const id = b.closest('[data-cat-id]').dataset.catId;
@@ -747,7 +835,7 @@ document.addEventListener('submit', (e) => {
   } else if (form.dataset.form === 'add-sub') {
     const t = selected();
     t.subtasks = [...(t.subtasks || []), { id: store.uid(), title: value, done: false }];
-    store.save('tasks', t);
+    commit('tasks', t);
     input.value = '';
     renderSubs(t);
   }
@@ -759,6 +847,13 @@ function onField(e) {
   if (target.dataset.input === 'sort') { prefs.sort = target.value; savePrefs(); renderList(); return; }
   if (target.dataset.input === 'import') { importFile(target.files[0]); target.value = ''; return; }
 
+  if (target.matches('[data-cat-custom]')) {
+    const li = target.closest('[data-cat-id]');
+    const c = store.get('categories', li.dataset.catId);
+    $('.swatch', li).style.background = target.value; // live preview while the picker is open
+    if (e.type === 'change') { c.color = target.value.toUpperCase(); store.save('categories', c); }
+    return;
+  }
   if (target.matches('[data-cat-name]')) {
     const c = store.get('categories', target.closest('[data-cat-id]').dataset.catId);
     c.name = target.value.trim() || c.name;
@@ -775,7 +870,7 @@ function onField(e) {
     if (target.dataset.subField === 'done') {
       sub.done = target.checked;
       target.closest('.sub').classList.toggle('done', sub.done);
-      store.save(kind, row);
+      commit(kind, row);
     } else { sub.title = target.value; saveSoon(kind, row.id); }
     return;
   }
@@ -784,27 +879,30 @@ function onField(e) {
     case 'title': row.title = target.value.replace(/\n/g, ' '); grow(target); saveSoon(kind, row.id); break;
     case 'notes': row.notes = target.value; grow(target); saveSoon(kind, row.id); break;
     case 'body': row.body = target.value; saveSoon(kind, row.id); break;
-    case 'category': row.category_id = target.value || null; store.save(kind, row); break;
+    case 'category': row.category_id = target.value || null; commit(kind, row); break;
     case 'remind':
       row.remind_offset = target.value === '' ? null : Number(target.value);
       row.remind_at = remindAt(row);
-      store.save(kind, row); paneState(row); break;
+      commit(kind, row); paneState(row); break;
     case 'due-date':
     case 'due-time':
       if (e.type !== 'change') return;
       setDue(row, $('[data-field="due-date"]', el.pane).value, $('[data-field="due-time"]', el.pane).value);
-      store.save(kind, row); paneState(row); break;
+      commit(kind, row); paneState(row); break;
   }
 }
 document.addEventListener('input', onField);
-document.addEventListener('change', (e) => { if (/^(date|time)$/.test(e.target.type)) onField(e); });
+document.addEventListener('change', (e) => { if (/^(date|time|color)$/.test(e.target.type)) onField(e); });
 
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape' && !el.settings.open) {
     if (el.nav.classList.contains('open')) setNavOpen(false);
     else if (ui.sel) closePane();
   }
-  if (e.key === 'Enter' && e.target.matches?.('.title-input')) { e.preventDefault(); e.target.blur(); }
+  if (e.key === 'Enter' && e.target.matches?.('.title-input')) {
+    e.preventDefault();
+    if (ui.sel?.draft && ui.sel.kind === 'tasks') createDraft(); else e.target.blur();
+  }
 });
 
 async function importFile(file) {
@@ -817,7 +915,7 @@ async function importFile(file) {
 }
 
 $('#auth-form').addEventListener('submit', submitAuth);
-el.settings.addEventListener('close', () => flushSave());
+el.settings.addEventListener('close', () => { flushSave(); ui.colorFor = null; ui.pushError = null; });
 
 // Data changed (here or on another device): redraw what could be affected.
 store.bus.addEventListener('change', (e) => {
@@ -848,7 +946,7 @@ function handleHash() {
   if (!/^(task=|new-task$|new-note$)/.test(hash)) return; // leave sign-in links for Supabase to read
   history.replaceState(null, '', location.pathname + location.search);
   if (hash.startsWith('task=')) openTaskById(hash.slice(5), true);
-  else if (hash === 'new-task') { setView('active'); $('.quick input')?.focus(); }
+  else if (hash === 'new-task') { setView('active'); ACTIONS['new-task-details'](); }
   else if (hash === 'new-note') { setView('notes'); ACTIONS['new-note'](); }
 }
 // A reminder can arrive for a task this device has not downloaded yet: sync once and retry.

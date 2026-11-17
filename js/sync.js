@@ -31,7 +31,11 @@ export function rememberedUser() {
 
 export async function init() {
   if (!configured) return;
-  client = window.supabase.createClient(cfg.supabaseUrl, cfg.supabaseKey, {
+  // Only the project address is wanted. Strip anything after it, such as the "/rest/v1/" the
+  // dashboard sometimes shows, which would make every request go to a path that does not exist.
+  let url = String(cfg.supabaseUrl).trim();
+  try { url = new URL(url).origin; } catch { /* leave as typed; the error message will point here */ }
+  client = window.supabase.createClient(url, cfg.supabaseKey.trim(), {
     auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true },
   });
   // Supabase asks that no other client calls run inside this callback, hence the timeout.
@@ -191,27 +195,76 @@ function friendly(e) {
 export const pushSupported = () =>
   'serviceWorker' in navigator && 'PushManager' in window && 'Notification' in window;
 
+// Every step below has a time limit. Some browsers (Samsung Internet among them) can leave one
+// of these calls hanging without an error, and then the button would seem to do nothing.
+const withTimeout = (promise, ms, message) =>
+  Promise.race([promise, new Promise((_, reject) => setTimeout(() => reject(new Error(message)), ms))]);
+
+const isSamsung = () => /SamsungBrowser/i.test(navigator.userAgent);
+const unblockHelp = () => isSamsung()
+  ? 'In Samsung Internet open Settings, find Notifications (under "Sites and downloads"), and allow this site. Also check Android Settings → Notifications → App notifications → Samsung Internet is on.'
+  : 'Allow notifications for this site in the browser settings, and check that the browser itself may send notifications in Android or Windows settings.';
+
 export async function pushState() {
   if (!pushSupported()) return 'unsupported';
   if (!configured || !cfg.vapidPublicKey) return 'unconfigured';
   if (Notification.permission === 'denied') return 'blocked';
-  const reg = await navigator.serviceWorker.getRegistration();
-  const sub = await reg?.pushManager.getSubscription();
-  return sub && Notification.permission === 'granted' ? 'on' : 'off';
+  try {
+    const reg = await withTimeout(navigator.serviceWorker.getRegistration(), 4000, 'timeout');
+    const sub = await withTimeout(reg ? reg.pushManager.getSubscription() : Promise.resolve(null), 4000, 'timeout');
+    return sub && Notification.permission === 'granted' ? 'on' : 'off';
+  } catch { return 'off'; }
 }
 
-export async function enablePush() {
+// Handles both the current promise form and the older callback form of requestPermission.
+function askPermission() {
+  if (Notification.permission === 'granted') return Promise.resolve('granted');
+  return new Promise((resolve) => {
+    const p = Notification.requestPermission(resolve);
+    if (p && typeof p.then === 'function') p.then(resolve, () => resolve('denied'));
+  });
+}
+
+async function workerRegistration() {
+  let reg = await withTimeout(navigator.serviceWorker.getRegistration(), 5000, 'no-worker');
+  if (!reg) reg = await navigator.serviceWorker.register('./sw.js');
+  if (reg.active) return reg;
+  return withTimeout(navigator.serviceWorker.ready, 15000, 'no-worker');
+}
+
+export async function enablePush(onStep = () => {}) {
   if (!user) throw new Error('Sign in first.');
-  const permission = await Notification.requestPermission();
-  if (permission !== 'granted') throw new Error('Notifications are blocked for this app. Allow them in your browser or system settings.');
-  const reg = await navigator.serviceWorker.ready;
+
+  onStep('Asking for permission…');
+  const permission = await withTimeout(askPermission(), 30000,
+    'No permission prompt appeared. ' + unblockHelp());
+  if (permission === 'denied') throw new Error('Notifications are blocked for Tidemark. ' + unblockHelp());
+  if (permission !== 'granted') throw new Error('The permission prompt was closed. Tap the button again and choose Allow.');
+
+  onStep('Starting the background worker…');
+  let reg;
+  try { reg = await workerRegistration(); }
+  catch { throw new Error('The app\'s background worker did not start. Close Tidemark completely, open it again while online, and try once more.'); }
+
+  onStep('Registering this device…');
   const key = b64urlToBytes(cfg.vapidPublicKey);
-  let sub = await reg.pushManager.getSubscription();
-  if (sub && !sameBytes(new Uint8Array(sub.options.applicationServerKey ?? []), key)) {
-    await sub.unsubscribe(); // the key in config.js changed
-    sub = null;
+  let sub = await withTimeout(reg.pushManager.getSubscription(), 8000, 'timeout').catch(() => null);
+  if (sub) {
+    const current = sub.options?.applicationServerKey;
+    if (current && !sameBytes(new Uint8Array(current), key)) { await sub.unsubscribe().catch(() => {}); sub = null; } // key in config.js changed
   }
-  sub ??= await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: key });
+  if (!sub) {
+    try {
+      sub = await withTimeout(reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: key }), 20000, 'timeout');
+    } catch (e) {
+      const why = e?.message === 'timeout' ? 'did not answer' : `refused (${e?.name || 'error'}: ${e?.message || e})`;
+      throw new Error(`The browser's push service ${why}. ` + (isSamsung()
+        ? 'Samsung Internet sometimes fails here. Update Samsung Internet in the Galaxy Store and try again, or install Tidemark from Chrome instead.'
+        : 'Check that you are online and try again.'));
+    }
+  }
+
+  onStep('Saving…');
   await saveSubscription(sub);
 }
 
@@ -227,8 +280,8 @@ export async function disablePush() {
 async function refreshPush() {
   try {
     if ((await pushState()) === 'on') {
-      const reg = await navigator.serviceWorker.ready;
-      const sub = await reg.pushManager.getSubscription();
+      const reg = await workerRegistration();
+      const sub = await withTimeout(reg.pushManager.getSubscription(), 8000, 'timeout');
       if (sub) await saveSubscription(sub);
     }
   } catch (e) { console.warn('Could not refresh push subscription', e); }
