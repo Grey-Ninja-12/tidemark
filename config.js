@@ -9,5 +9,5 @@ window.TIDEMARK_CONFIG = {
   supabaseKey: "sb_publishable_9GE3_ZX7OJ3_bkRDmcr8Ag_skv2Ps6w",
 
   // The PUBLIC key from tools/generate-vapid-keys.html. Needed for reminders.
-  vapidPublicKey: "",
+  vapidPublicKey: "BP1NtMZpgNz0zVhv4TbZDgTvwTqp_EhS9k13tsglIcsWHMglip9dLGoX4qXyEW-VrqbPZyt2h51SSWfQ8kmH2co",
 };
