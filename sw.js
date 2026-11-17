@@ -1,6 +1,6 @@
 // Tidemark service worker: makes the app open offline and shows reminder notifications.
 // Bump VERSION whenever you change files in this folder, so devices pick up the new copy.
-const VERSION = 'v2';
+const VERSION = 'v4';
 const CACHE = `tidemark-${VERSION}`;
 const SHELL = [
   './', './index.html', './styles.css', './config.js', './manifest.webmanifest',
