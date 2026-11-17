@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Tidemark</title>
+  <meta name="description" content="Tasks, deadlines and notes, synced between your devices.">
+  <meta name="theme-color" content="#0B6B78">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icons/favicon.png">
+  <link rel="apple-touch-icon" href="icons/icon-192.png">
+  <link rel="preload" href="fonts/instrument.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <!-- Sign-in screen (only when sync is configured and nobody is signed in) -->
+  <div id="auth" class="auth" hidden>
+    <form id="auth-form" class="auth-card" novalidate>
+      <h1 class="brand"><img src="icons/icon-192.png" alt="" width="40" height="40">Tidemark</h1>
+      <p id="auth-lead" class="auth-lead">Sign in to see your tasks and notes on this device.</p>
+      <label class="field" id="auth-email-field"><span>Email</span>
+        <input id="auth-email" type="email" autocomplete="email" required>
+      </label>
+      <label class="field" id="auth-password-field"><span id="auth-password-label">Password</span>
+        <input id="auth-password" type="password" autocomplete="current-password" minlength="8" required>
+      </label>
+      <p id="auth-msg" class="auth-msg" role="status"></p>
+      <button class="btn primary" id="auth-submit" type="submit">Sign in</button>
+      <div class="auth-links">
+        <button type="button" class="link" data-auth="signup">Create an account</button>
+        <button type="button" class="link" data-auth="reset">Forgot password?</button>
+        <button type="button" class="link" data-auth="signin" hidden>Back to sign in</button>
+        <button type="button" class="link" data-auth="back" hidden>Back to my tasks</button>
+      </div>
+    </form>
+  </div>
+
+  <div id="app" class="app" hidden>
+    <aside id="nav" class="nav" aria-label="Views"></aside>
+    <div id="scrim" class="scrim" hidden></div>
+    <main id="main" class="main">
+      <header id="bar" class="bar"></header>
+      <div id="list" class="list" aria-live="polite"></div>
+    </main>
+    <section id="pane" class="pane" aria-label="Details" hidden></section>
+  </div>
+
+  <dialog id="settings" class="dialog" aria-labelledby="settings-title"></dialog>
+  <div id="toast" class="toast" role="status" hidden></div>
+
+  <noscript>Tidemark needs JavaScript.</noscript>
+  <script src="config.js"></script>
+  <script src="vendor/supabase.js"></script>
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>
