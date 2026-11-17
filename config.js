@@ -2,7 +2,7 @@
 // While they are empty the app works on this device only, without sign-in or sync.
 window.TIDEMARK_CONFIG = {
   // Supabase → Project Settings → API (Data API) → Project URL, e.g. "https://abcdefgh.supabase.co"
-  supabaseUrl: "https://qbbxavnrdluekfjwxiao.supabase.co/rest/v1/",
+  supabaseUrl: "https://qbbxavnrdluekfjwxiao.supabase.co",
 
   // Supabase → Project Settings → API Keys → Publishable key ("sb_publishable_...").
   // On older projects the "anon" key works too. This key is safe to publish.
