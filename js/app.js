@@ -40,8 +40,11 @@ const ICON = {
   close: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>',
   plus: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>',
   search: '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6.5"/><path d="M16 16l4.5 4.5"/></svg>',
-  gear: '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M18.4 5.6l-2.1 2.1M7.7 16.3l-2.1 2.1"/></svg>',
+  gear: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10.21 4.82L10.58 1.90L13.42 1.90L13.79 4.82A7.4 7.4 0 0 1 15.81 5.66L18.14 3.85L20.15 5.86L18.34 8.19A7.4 7.4 0 0 1 19.18 10.21L22.10 10.58L22.10 13.42L19.18 13.79A7.4 7.4 0 0 1 18.34 15.81L20.15 18.14L18.14 20.15L15.81 18.34A7.4 7.4 0 0 1 13.79 19.18L13.42 22.10L10.58 22.10L10.21 19.18A7.4 7.4 0 0 1 8.19 18.34L5.86 20.15L3.85 18.14L5.66 15.81A7.4 7.4 0 0 1 4.82 13.79L1.90 13.42L1.90 10.58L4.82 10.21A7.4 7.4 0 0 1 5.66 8.19L3.85 5.86L5.86 3.85L8.19 5.66A7.4 7.4 0 0 1 10.21 4.82Z"/><circle cx="12" cy="12" r="3.2"/></svg>',
   trash: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7h14M10 7V4h4v3M7 7l1 13h8l1-13"/></svg>',
+  calendar: '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="5.5" width="16" height="14.5" rx="1.5"/><path d="M4 10h16M8.5 3.5v4M15.5 3.5v4"/></svg>',
+  prev: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14.5 6l-6 6 6 6"/></svg>',
+  next: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9.5 6l6 6-6 6"/></svg>',
   pin: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 4h6l-1 6 3 3H7l3-3-1-6zM12 13v7"/></svg>',
 };
 
@@ -161,6 +164,51 @@ function defaultsSummary(c) {
   if (c.def_remind_offset != null) parts.push(`reminder ${(REMINDERS.find(([v]) => v === c.def_remind_offset)?.[1] || '').toLowerCase()}`);
   return parts.length ? `New tasks: ${parts.join(', ')}.` : '';
 }
+
+// ---------- calendar (weeks start on Monday) ----------
+
+const fmtFullDate = new Intl.DateTimeFormat(undefined, { weekday: 'short', day: 'numeric', month: 'short', year: 'numeric' });
+const fmtMonth = new Intl.DateTimeFormat(undefined, { month: 'long', year: 'numeric' });
+const fmtDayName = new Intl.DateTimeFormat(undefined, { weekday: 'short' });
+const fmtDayLong = new Intl.DateTimeFormat(undefined, { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
+const MONDAY_FIRST = Array.from({ length: 7 }, (_, i) => fmtDayName.format(new Date(2026, 10, 16 + i))); // 16 Nov 2026 is a Monday
+
+function calendarHtml(t) {
+  const { y, m } = ui.cal;
+  const first = new Date(y, m, 1);
+  const lead = (first.getDay() + 6) % 7; // days shown from the previous month, counting from Monday
+  const selectedDay = t.due_at ? localDate(new Date(t.due_at)) : '';
+  const today = localDate(new Date());
+  const tomorrow = localDate(new Date(Date.now() + DAY));
+  let cells = '';
+  for (let i = 0; i < 42; i++) {
+    const d = new Date(y, m, 1 - lead + i);
+    const v = localDate(d);
+    cells += `<button type="button" data-act="cal-day" data-value="${v}" class="${d.getMonth() !== m ? 'other' : ''}${v === today ? ' today' : ''}" aria-pressed="${v === selectedDay}" aria-label="${esc(fmtDayLong.format(d))}">${d.getDate()}</button>`;
+  }
+  return `
+    <div class="cal" role="group" aria-label="Choose a deadline date">
+      <div class="cal-head">
+        <button type="button" class="icon small" data-act="cal-move" data-value="-1" aria-label="Previous month">${ICON.prev}</button>
+        <span>${esc(fmtMonth.format(first))}</span>
+        <button type="button" class="icon small" data-act="cal-move" data-value="1" aria-label="Next month">${ICON.next}</button>
+      </div>
+      <div class="cal-grid">${MONDAY_FIRST.map((n) => `<span>${esc(n)}</span>`).join('')}${cells}</div>
+      <div class="cal-foot">
+        <button type="button" class="btn small" data-act="cal-day" data-value="${today}">Today</button>
+        <button type="button" class="btn small" data-act="cal-day" data-value="${tomorrow}">Tomorrow</button>
+      </div>
+    </div>`;
+}
+function renderCalendar() {
+  const t = selected();
+  const box = $('[data-cal]', el.pane);
+  if (!t || !box) return;
+  box.innerHTML = ui.cal?.id === t.id ? calendarHtml(t) : '';
+  $('[data-act="pick-date"]', el.pane).setAttribute('aria-expanded', ui.cal?.id === t.id);
+  $('[data-date-label]', el.pane).textContent = t.due_at ? fmtFullDate.format(new Date(t.due_at)) : 'Choose a date';
+}
+function closeCalendar() { if (ui.cal) { ui.cal = null; renderCalendar(); } }
 
 function setStatus(t, status) {
   t.status = status;
@@ -450,11 +498,35 @@ function closePane() {
   renderList();
 }
 
+// Redraws part of the screen without losing the scroll position or the focused control,
+// so the view doesn't jump back to the top after each click.
+function focusKey(root) {
+  const a = document.activeElement;
+  if (!a || a === root || !root.contains(a)) return null;
+  const own = ['data-act', 'data-value', 'data-cat-def', 'data-field', 'data-cat-name', 'data-input']
+    .filter((n) => a.hasAttribute(n)).map((n) => `[${n}="${CSS.escape(a.getAttribute(n))}"]`).join('');
+  if (!own) return null;
+  const cat = a.closest('[data-cat-id]');
+  return (cat ? `[data-cat-id="${CSS.escape(cat.dataset.catId)}"] ` : '') + own;
+}
+function redraw(root, scroller, html) {
+  const box = root.querySelector(scroller);
+  const top = box ? box.scrollTop : 0;
+  const key = focusKey(root);
+  root.innerHTML = html;
+  const nb = root.querySelector(scroller);
+  if (nb) nb.scrollTop = top;
+  if (key) root.querySelector(key)?.focus({ preventScroll: true });
+}
+
 function renderPane() {
   const row = selected();
-  if (!row || row.deleted) { ui.sel = null; el.pane.hidden = true; el.pane.innerHTML = ''; return; }
+  if (!row || row.deleted) { ui.sel = null; el.pane.hidden = true; el.pane.innerHTML = ''; delete el.pane.dataset.row; return; }
   el.pane.hidden = false;
-  el.pane.innerHTML = ui.sel.kind === 'tasks' ? taskPane(row) : notePane(row);
+  const html = ui.sel.kind === 'tasks' ? taskPane(row) : notePane(row);
+  if (el.pane.dataset.row === row.id) redraw(el.pane, '.pane-body', html);   // same item: keep place
+  else el.pane.innerHTML = html;                                            // another item: start at the top
+  el.pane.dataset.row = row.id;
   el.pane.querySelectorAll('textarea[data-grow]').forEach(grow);
   if (ui.sel.kind === 'tasks') paneState(row);
 }
@@ -486,10 +558,12 @@ function taskPane(t) {
 
       <div class="field"><span class="label">Deadline</span>
         <div class="row">
-          <input type="date" data-field="due-date" aria-label="Deadline date" value="${d ? localDate(d) : ''}">
+          <button type="button" class="date-btn" data-act="pick-date" aria-expanded="${ui.cal?.id === t.id}">${ICON.calendar}<span data-date-label>${d ? esc(fmtFullDate.format(d)) : 'Choose a date'}</span></button>
+          <input type="hidden" data-field="due-date" value="${d ? localDate(d) : ''}">
           <input type="time" data-field="due-time" aria-label="Deadline time (optional)" value="${d && !t.due_all_day ? localTime(d) : ''}">
           <button class="link" data-act="clear-due">Clear</button>
         </div>
+        <div data-cal>${ui.cal?.id === t.id ? calendarHtml(t) : ''}</div>
       </div>
 
       <label class="field"><span class="label">Reminder</span>
@@ -628,7 +702,7 @@ function renderSettings() {
 
   const cats = store.list('categories').sort((a, b) => a.name.localeCompare(b.name));
 
-  el.settings.innerHTML = `
+  redraw(el.settings, '.dialog-body', `
     <div class="dialog-head"><h2 id="settings-title">Settings</h2><button class="icon" data-act="close-settings" aria-label="Close settings">${ICON.close}</button></div>
     <div class="dialog-body">
       <section><h3>Account and sync</h3>${account}</section>
@@ -661,7 +735,7 @@ function renderSettings() {
         <div class="row"><button class="btn" data-act="export">Save backup file</button><label class="btn">Load backup file<input type="file" accept="application/json,.json" data-input="import" hidden></label></div>
       </section>
       ${ui.installEvent ? `<section><h3>Install</h3><p class="hint">Add Tidemark to this device so it opens in its own window.</p><div class="row"><button class="btn primary" data-act="install">Install Tidemark</button></div></section>` : ''}
-    </div>`;
+    </div>`);
 }
 
 function defaultsPanel(c) {
@@ -820,7 +894,30 @@ const ACTIONS = {
   'clear-due': () => {
     const t = selected(); touched(t, 'deadline'); setDue(t, '', '');
     $('[data-field="due-date"]', el.pane).value = ''; $('[data-field="due-time"]', el.pane).value = '';
-    commit('tasks', t); paneState(t);
+    ui.cal = null;
+    commit('tasks', t); paneState(t); renderCalendar();
+  },
+  'pick-date': () => {
+    const t = selected();
+    if (ui.cal?.id === t.id) { closeCalendar(); return; }
+    const d = t.due_at ? new Date(t.due_at) : new Date();
+    ui.cal = { id: t.id, y: d.getFullYear(), m: d.getMonth() };
+    renderCalendar();
+  },
+  'cal-move': (b) => {
+    const d = new Date(ui.cal.y, ui.cal.m + Number(b.dataset.value), 1);
+    ui.cal.y = d.getFullYear(); ui.cal.m = d.getMonth();
+    renderCalendar();
+    $(`[data-act="cal-move"][data-value="${b.dataset.value}"]`, el.pane)?.focus();
+  },
+  'cal-day': (b) => {
+    const t = selected();
+    $('[data-field="due-date"]', el.pane).value = b.dataset.value;
+    touched(t, 'deadline');
+    setDue(t, b.dataset.value, $('[data-field="due-time"]', el.pane).value);
+    ui.cal = null;
+    commit('tasks', t); paneState(t); renderCalendar();
+    $('[data-act="pick-date"]', el.pane)?.focus();
   },
   'remove-sub': (b) => {
     const t = selected(); const id = b.closest('.sub').dataset.sub;
@@ -913,6 +1010,7 @@ const ACTIONS = {
 };
 
 document.addEventListener('click', (e) => {
+  if (ui.cal && !e.target.closest('[data-cal], [data-act="pick-date"]')) closeCalendar(); // click outside the calendar
   const act = e.target.closest('[data-act]');
   if (act) { e.preventDefault(); ACTIONS[act.dataset.act]?.(act); return; }
   const view = e.target.closest('[data-view]');
@@ -1046,7 +1144,8 @@ document.addEventListener('change', (e) => { if (/^(date|time|color|number)$/.te
 
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape' && !el.settings.open) {
-    if (el.nav.classList.contains('open')) setNavOpen(false);
+    if (ui.cal) { closeCalendar(); $('[data-act="pick-date"]', el.pane)?.focus(); }
+    else if (el.nav.classList.contains('open')) setNavOpen(false);
     else if (ui.sel) closePane();
   }
   if (e.key === 'Enter' && e.target.matches?.('.title-input')) {
