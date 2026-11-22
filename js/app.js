@@ -347,6 +347,7 @@ function renderNav() {
 }
 
 function setNavOpen(open) {
+  scheduleGuard();
   el.nav.classList.toggle('open', open);
   el.scrim.hidden = !open;
 }
@@ -628,6 +629,7 @@ function renderPane() {
   el.pane.dataset.row = row.id;
   el.pane.querySelectorAll('textarea[data-grow]').forEach(grow);
   if (ui.sel.kind === 'tasks') paneState(row);
+  scheduleGuard();
 }
 
 const paneHead = (what, draft = false) => `
@@ -761,6 +763,7 @@ async function openSettings() {
   ui.push = await sync.pushState().catch(() => 'off');
   renderSettings();
   if (!el.settings.open) el.settings.showModal();
+  scheduleGuard();
 }
 
 function renderSettings() {
@@ -946,6 +949,7 @@ async function submitAuth(e) {
 function renderAll() { renderNav(); renderBar(); renderList(); renderPane(); }
 
 function setView(view) {
+  rememberView(view, prefs.category);
   if (ui.sel?.draft && view === 'notes') discardDraft();
   flushSave();
   prefs.view = view; savePrefs();
@@ -1173,7 +1177,7 @@ document.addEventListener('click', (e) => {
   const view = e.target.closest('[data-view]');
   if (view) { setView(view.dataset.view); return; }
   const cat = e.target.closest('[data-cat]');
-  if (cat) { prefs.category = cat.dataset.cat || null; savePrefs(); setNavOpen(false); renderAll(); return; }
+  if (cat) { rememberView(prefs.view, cat.dataset.cat || null); prefs.category = cat.dataset.cat || null; savePrefs(); setNavOpen(false); renderAll(); return; }
   const auth = e.target.closest('[data-auth]');
   if (auth) {
     if (auth.dataset.auth === 'back') { ui.forceAuth = false; showScreen(); } else setAuthMode(auth.dataset.auth);
@@ -1325,7 +1329,69 @@ async function importFile(file) {
 }
 
 $('#auth-form').addEventListener('submit', submitAuth);
-el.settings.addEventListener('close', () => { flushSave(); ui.colorFor = null; ui.defaultsFor = null; ui.pushError = null; });
+el.settings.addEventListener('close', () => { flushSave(); ui.colorFor = null; ui.defaultsFor = null; ui.pushError = null; scheduleGuard(); });
+// Escape, or the phone's back gesture, first closes an open colour or defaults panel inside Settings.
+el.settings.addEventListener('cancel', (e) => {
+  if (ui.defaultsFor || ui.colorFor) { e.preventDefault(); ui.defaultsFor = null; ui.colorFor = null; renderSettings(); }
+});
+
+// ---------- phone back button ----------
+// Android's back button (and Alt+Left on a PC) steps back through what is open: the calendar,
+// a panel inside Settings, Settings, the side menu, a reminder being added, the task or note,
+// then the views you came through. Only when nothing is left does it leave the app.
+// This works with a single extra history entry (the "guard") that is there whenever there is
+// something to go back to. Pressing back uses it up; the app then closes one thing and puts the
+// guard back if more is open.
+const viewTrail = [];
+function rememberView(view, categoryId) {
+  const last = { view: prefs.view, category: prefs.category };
+  if (last.view === view && last.category === categoryId) return;
+  viewTrail.push(last);
+  if (viewTrail.length > 30) viewTrail.shift();
+}
+function topLayer() {
+  if (ui.cal) return 'calendar';
+  if (el.settings.open) return ui.defaultsFor || ui.colorFor ? 'settings-panel' : 'settings';
+  if (el.nav.classList.contains('open')) return 'menu';
+  if (ui.sel && ui.remAdd) return 'reminder';
+  if (ui.sel) return 'pane';
+  if (viewTrail.length) return 'view';
+  return null;
+}
+function closeLayer(layer) {
+  switch (layer) {
+    case 'calendar': closeCalendar(); break;
+    case 'settings-panel': ui.defaultsFor = null; ui.colorFor = null; renderSettings(); break;
+    case 'settings': el.settings.close(); break;
+    case 'menu': setNavOpen(false); break;
+    case 'reminder': ui.remAdd = null; renderPane(); break;
+    case 'pane': closePane(); break;
+    case 'view': {
+      const v = viewTrail.pop();
+      flushSave();
+      if (ui.sel?.draft && v.view === 'notes') discardDraft();
+      if (ui.sel && (ui.sel.kind === 'notes') !== (v.view === 'notes')) ui.sel = null;
+      prefs.view = v.view; prefs.category = category(v.category) ? v.category : null; savePrefs();
+      renderAll();
+      break;
+    }
+  }
+}
+const back = { ignore: 0, timer: 0 };
+const onGuard = () => history.state?.tidemarkGuard === true;
+function updateGuard() {
+  const needed = topLayer() !== null;
+  if (needed && !onGuard()) history.pushState({ tidemarkGuard: true }, '');
+  else if (!needed && onGuard()) { back.ignore++; history.back(); } // nothing left: remove the guard
+}
+function scheduleGuard() { clearTimeout(back.timer); back.timer = setTimeout(updateGuard, 0); }
+window.addEventListener('popstate', () => {
+  if (back.ignore) { back.ignore--; return; }
+  const layer = topLayer();
+  if (layer) closeLayer(layer);
+  scheduleGuard();
+});
+for (const type of ['click', 'keydown', 'input', 'submit']) document.addEventListener(type, scheduleGuard);
 
 // Data changed (here or on another device): redraw what could be affected.
 store.bus.addEventListener('change', (e) => {
@@ -1382,7 +1448,7 @@ async function start() {
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register('./sw.js').catch((e) => console.warn('Service worker failed', e));
     navigator.serviceWorker.addEventListener('message', (e) => {
-      if (e.data?.type === 'open-task') { location.hash = 'task=' + e.data.id; }
+      if (e.data?.type === 'open-task') openTaskById(e.data.id, true);
     });
   }
 
