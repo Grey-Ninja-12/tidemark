@@ -14,20 +14,53 @@ export const nowIso = () => new Date().toISOString();
 export const DEFAULTS = {
   tasks: () => ({
     title: '', notes: '', priority: 0, status: 'todo',
-    due_at: null, due_all_day: true, remind_offset: null, remind_at: null,
-    category_id: null, subtasks: [], started_at: null, completed_at: null,
+    due_at: null, due_all_day: true,
+    reminders: [],      // [{ id, minutes }] before the deadline, or [{ id, at }] at a fixed moment
+    remind_times: [],   // when those reminders fire, worked out on save; the server reads this
+    category_ids: [], subtasks: [], started_at: null, completed_at: null,
+    // Older single-value fields, still filled in so older copies of the app keep working.
+    category_id: null, remind_offset: null, remind_at: null,
   }),
-  notes: () => ({ title: '', body: '', category_id: null, pinned: false }),
+  notes: () => ({ title: '', body: '', category_ids: [], category_id: null, pinned: false }),
   categories: () => ({
     name: '', color: '#0B6B78',
     // Defaults for tasks in this category. Deadline: "days" = N days after creation, "weekday" = next given weekday (0 = Sunday).
-    def_priority: null, def_due_kind: null, def_due_days: null, def_due_weekday: null, def_due_time: null, def_remind_offset: null,
+    def_priority: null, def_due_kind: null, def_due_days: null, def_due_weekday: null, def_due_time: null,
+    def_reminders: [],  // minutes before the deadline
+    def_remind_offset: null, // older single reminder
   }),
 };
 
+// When a task's reminders fire. Deadlines without a clock time count from 09:00 that day.
+export function remindTimes(t) {
+  const out = new Set();
+  for (const r of t.reminders || []) {
+    if (r.at) out.add(new Date(r.at).toISOString());
+    else if (r.minutes != null && t.due_at) {
+      const base = new Date(t.due_at);
+      if (t.due_all_day) base.setHours(9, 0, 0, 0);
+      out.add(new Date(base.getTime() - r.minutes * 60000).toISOString());
+    }
+  }
+  return [...out].sort();
+}
+
+// Brings rows saved by older versions (one category, one reminder) up to the current shape.
+function upgrade(kind, r) {
+  if (kind !== 'categories' && !Array.isArray(r.category_ids)) r.category_ids = r.category_id ? [r.category_id] : [];
+  if (kind === 'tasks' && !Array.isArray(r.reminders)) {
+    r.reminders = r.remind_offset != null ? [{ id: uid(), minutes: r.remind_offset }] : [];
+    r.remind_times = remindTimes(r);
+  }
+  if (kind === 'categories' && !Array.isArray(r.def_reminders)) {
+    r.def_reminders = r.def_remind_offset != null ? [r.def_remind_offset] : [];
+  }
+  return r;
+}
+
 export async function load() {
   for (const kind of KINDS) {
-    state[kind] = new Map((await idb.all(kind)).map((r) => [r.id, r]));
+    state[kind] = new Map((await idb.all(kind)).map((r) => [r.id, upgrade(kind, r)]));
   }
 }
 
@@ -40,6 +73,13 @@ export function create(kind, fields = {}) {
 }
 
 export function save(kind, row) {
+  if (kind !== 'categories') row.category_id = row.category_ids?.[0] ?? null;
+  if (kind === 'tasks') {
+    row.remind_times = remindTimes(row);
+    row.remind_at = row.remind_times[0] ?? null;
+    row.remind_offset = null;
+  }
+  if (kind === 'categories') row.def_remind_offset = null;
   row.updated_at = nowIso();
   row._dirty = 1;
   state[kind].set(row.id, row);
@@ -75,7 +115,7 @@ export async function applyRemote(kind, rows) {
       if (!local._dirty && lt === rt) continue;
     }
     const { user_id, synced_at, ...fields } = remote;
-    const row = { ...DEFAULTS[kind](), ...fields, _dirty: 0 };
+    const row = { ...DEFAULTS[kind](), ...upgrade(kind, fields), _dirty: 0 };
     state[kind].set(row.id, row);
     changed.push(row);
   }
@@ -132,7 +172,7 @@ export async function importAll(data) {
   for (const kind of KINDS) {
     for (const r of data[kind] ?? []) {
       if (!r || typeof r.id !== 'string') continue;
-      const row = { ...DEFAULTS[kind](), created_at: nowIso(), ...r, deleted: false, updated_at: nowIso(), _dirty: 1 };
+      const row = { ...DEFAULTS[kind](), created_at: nowIso(), ...upgrade(kind, { ...r }), deleted: false, updated_at: nowIso(), _dirty: 1 };
       state[kind].set(row.id, row);
       await idb.put(kind, row);
       count++;

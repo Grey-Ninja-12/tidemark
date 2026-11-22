@@ -15,7 +15,7 @@ const PREFS_KEY = 'tidemark.prefs';
 const prefs = { view: 'active', sort: 'deadline', theme: 'system', category: null };
 try { Object.assign(prefs, JSON.parse(localStorage.getItem(PREFS_KEY) || '{}')); } catch { /* defaults */ }
 const savePrefs = () => localStorage.setItem(PREFS_KEY, JSON.stringify(prefs));
-const ui = { search: '', sel: null, draft: null, push: 'off', pushStep: null, pushError: null, colorFor: null, defaultsFor: null, installEvent: null, authMode: 'signin', forceAuth: false };
+const ui = { search: '', sel: null, draft: null, remAdd: null, cal: null, push: 'off', pushStep: null, pushError: null, colorFor: null, defaultsFor: null, installEvent: null, authMode: 'signin', forceAuth: false };
 
 const VIEWS = { active: 'To do', today: 'Due today', started: 'Started', completed: 'Completed', notes: 'Notes' };
 const STATUS = { todo: 'To do', started: 'Started', completed: 'Completed' };
@@ -98,14 +98,24 @@ function setDue(t, dateStr, timeStr) {
   if (!dateStr) { t.due_at = null; t.due_all_day = true; }
   else if (timeStr) { t.due_at = new Date(`${dateStr}T${timeStr}`).toISOString(); t.due_all_day = false; }
   else { t.due_at = new Date(`${dateStr}T23:59:59`).toISOString(); t.due_all_day = true; }
-  t.remind_at = remindAt(t);
 }
-// Date-only deadlines have no clock time, so their reminders count back from 09:00 that day.
-function remindAt(t) {
-  if (!t.due_at || t.remind_offset == null) return null;
-  const base = new Date(t.due_at);
-  if (t.due_all_day) base.setHours(9, 0, 0, 0);
-  return new Date(base.getTime() - t.remind_offset * 60000).toISOString();
+
+// "1 hour before", "3 days before", "At the deadline"
+const UNITS = [[10080, 'week'], [1440, 'day'], [60, 'hour'], [1, 'minute']];
+function offsetLabel(minutes) {
+  const preset = REMINDERS.find(([v]) => v === minutes);
+  if (preset) return preset[1];
+  const [size, unit] = UNITS.find(([u]) => minutes % u === 0);
+  const n = minutes / size;
+  return `${n} ${unit}${n === 1 ? '' : 's'} before`;
+}
+const reminderLabel = (r) => (r.at ? `${fmtFullDate.format(new Date(r.at))} at ${fmtTime.format(new Date(r.at))}` : offsetLabel(r.minutes));
+function addReminder(t, r) {
+  const list = t.reminders || [];
+  const same = r.at ? list.some((x) => x.at && Date.parse(x.at) === Date.parse(r.at)) : list.some((x) => !x.at && x.minutes === r.minutes);
+  if (same) return false;
+  t.reminders = [...list, { id: store.uid(), ...r }];
+  return true;
 }
 // ---------- category defaults ----------
 
@@ -129,28 +139,49 @@ function categoryDue(c, now = new Date()) {
   return [localDate(d), c.def_due_time || ''];
 }
 
-// Gives a task its category's defaults for every setting it doesn't have yet. Returns what was filled in.
-function applyCategoryDefaults(t, categoryId) {
-  const c = category(categoryId);
-  const filled = [];
-  if (!c) return filled;
-  if (c.def_priority && !t.priority) { t.priority = c.def_priority; filled.push('priority'); }
-  if (c.def_remind_offset != null && t.remind_offset == null) { t.remind_offset = c.def_remind_offset; filled.push('reminder'); }
-  const due = !t.due_at && categoryDue(c);
-  if (due) { setDue(t, ...due); filled.push('deadline'); }
-  t.remind_at = remindAt(t);
+// Several categories combine: the highest priority, the earliest deadline, and all their reminders.
+function combinedDefaults(ids) {
+  let priority = 0, due = null, stamp = Infinity;
+  const reminders = [];
+  for (const c of (ids || []).map(category).filter(Boolean)) {
+    priority = Math.max(priority, c.def_priority || 0);
+    const d = categoryDue(c);
+    const at = d && new Date(`${d[0]}T${d[1] || '23:59:59'}`).getTime();
+    if (d && at < stamp) { due = d; stamp = at; }
+    for (const m of c.def_reminders || []) if (!reminders.includes(m)) reminders.push(m);
+  }
+  return { priority, due, reminders };
+}
+
+// Gives a task the defaults of these categories for every setting it doesn't have yet,
+// and adds their reminders. Returns what was filled in.
+function applyCategoryDefaults(t, ids) {
+  const d = combinedDefaults(ids);
+  const filled = { priority: false, deadline: false, reminders: [] };
+  if (d.priority && !t.priority) { t.priority = d.priority; filled.priority = true; }
+  if (d.due && !t.due_at) { setDue(t, ...d.due); filled.deadline = true; }
+  t.reminders ??= [];
+  for (const minutes of d.reminders) {
+    if (addReminder(t, { minutes })) filled.reminders.push(t.reminders[t.reminders.length - 1].id);
+  }
   return filled;
 }
-// In the new-task form, settings that came from a category are swapped when the category changes,
-// unless the user has set them by hand since.
-function touched(t, what) { if (t._auto) t._auto = t._auto.filter((x) => x !== what); }
+function filledText(f) {
+  const parts = [];
+  if (f.priority) parts.push('priority');
+  if (f.deadline) parts.push('deadline');
+  if (f.reminders.length) parts.push(f.reminders.length === 1 ? '1 reminder' : `${f.reminders.length} reminders`);
+  return parts.join(', ');
+}
+// In the new-task form, settings that came from categories are swapped when the categories change,
+// unless the user has changed them by hand since.
+function touched(t, what) { if (t._auto) t._auto[what] = false; }
 function swapDraftCategory(t) {
-  for (const what of t._auto || []) {
-    if (what === 'priority') t.priority = 0;
-    if (what === 'reminder') t.remind_offset = null;
-    if (what === 'deadline') setDue(t, '', '');
-  }
-  t._auto = applyCategoryDefaults(t, t.category_id);
+  const auto = t._auto || { reminders: [] };
+  if (auto.priority) t.priority = 0;
+  if (auto.deadline) setDue(t, '', '');
+  t.reminders = (t.reminders || []).filter((r) => !auto.reminders.includes(r.id));
+  t._auto = applyCategoryDefaults(t, t.category_ids);
 }
 
 function defaultsSummary(c) {
@@ -161,7 +192,8 @@ function defaultsSummary(c) {
     parts.push(`due ${c.def_due_days === 0 ? 'the same day' : c.def_due_days === 1 ? '1 day later' : `${c.def_due_days} days later`}${at}`);
   }
   if (c.def_due_kind === 'weekday' && c.def_due_weekday != null) parts.push(`due the next ${WEEKDAYS[c.def_due_weekday]}${at}`);
-  if (c.def_remind_offset != null) parts.push(`reminder ${(REMINDERS.find(([v]) => v === c.def_remind_offset)?.[1] || '').toLowerCase()}`);
+  const rems = [...(c.def_reminders || [])].sort((a, b) => b - a).map((m) => offsetLabel(m).toLowerCase());
+  if (rems.length) parts.push(`${rems.length === 1 ? 'reminder' : 'reminders'} ${rems.join(' and ')}`);
   return parts.length ? `New tasks: ${parts.join(', ')}.` : '';
 }
 
@@ -173,11 +205,12 @@ const fmtDayName = new Intl.DateTimeFormat(undefined, { weekday: 'short' });
 const fmtDayLong = new Intl.DateTimeFormat(undefined, { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' });
 const MONDAY_FIRST = Array.from({ length: 7 }, (_, i) => fmtDayName.format(new Date(2026, 10, 16 + i))); // 16 Nov 2026 is a Monday
 
-function calendarHtml(t) {
+const calSelected = (t, target) => (target === 'remind' ? ui.remAdd?.date || '' : t.due_at ? localDate(new Date(t.due_at)) : '');
+const calOpen = (t, target) => ui.cal?.id === t.id && ui.cal.target === target;
+function calendarHtml(selectedDay) {
   const { y, m } = ui.cal;
   const first = new Date(y, m, 1);
   const lead = (first.getDay() + 6) % 7; // days shown from the previous month, counting from Monday
-  const selectedDay = t.due_at ? localDate(new Date(t.due_at)) : '';
   const today = localDate(new Date());
   const tomorrow = localDate(new Date(Date.now() + DAY));
   let cells = '';
@@ -187,7 +220,7 @@ function calendarHtml(t) {
     cells += `<button type="button" data-act="cal-day" data-value="${v}" class="${d.getMonth() !== m ? 'other' : ''}${v === today ? ' today' : ''}" aria-pressed="${v === selectedDay}" aria-label="${esc(fmtDayLong.format(d))}">${d.getDate()}</button>`;
   }
   return `
-    <div class="cal" role="group" aria-label="Choose a deadline date">
+    <div class="cal" role="group" aria-label="Choose a date">
       <div class="cal-head">
         <button type="button" class="icon small" data-act="cal-move" data-value="-1" aria-label="Previous month">${ICON.prev}</button>
         <span>${esc(fmtMonth.format(first))}</span>
@@ -202,11 +235,16 @@ function calendarHtml(t) {
 }
 function renderCalendar() {
   const t = selected();
-  const box = $('[data-cal]', el.pane);
-  if (!t || !box) return;
-  box.innerHTML = ui.cal?.id === t.id ? calendarHtml(t) : '';
-  $('[data-act="pick-date"]', el.pane).setAttribute('aria-expanded', ui.cal?.id === t.id);
-  $('[data-date-label]', el.pane).textContent = t.due_at ? fmtFullDate.format(new Date(t.due_at)) : 'Choose a date';
+  if (!t) return;
+  for (const box of el.pane.querySelectorAll('[data-cal]')) {
+    const target = box.dataset.cal;
+    box.innerHTML = calOpen(t, target) ? calendarHtml(calSelected(t, target)) : '';
+    $(`[data-act="pick-date"][data-target="${target}"]`, el.pane)?.setAttribute('aria-expanded', calOpen(t, target));
+  }
+  const due = $('[data-date-label="due"]', el.pane);
+  if (due) due.textContent = t.due_at ? fmtFullDate.format(new Date(t.due_at)) : 'Choose a date';
+  const rem = $('[data-date-label="remind"]', el.pane);
+  if (rem) rem.textContent = ui.remAdd?.date ? fmtFullDate.format(new Date(`${ui.remAdd.date}T12:00`)) : 'Choose a date';
 }
 function closeCalendar() { if (ui.cal) { ui.cal = null; renderCalendar(); } }
 
@@ -229,7 +267,7 @@ function visibleTasks() {
   else rows = rows.filter((t) => t.status !== 'completed');
   if (prefs.view === 'today') rows = rows.filter((t) => ['overdue', 'today'].includes(bucket(t)));
   if (prefs.view === 'started') rows = rows.filter((t) => t.status === 'started');
-  if (prefs.category) rows = rows.filter((t) => t.category_id === prefs.category);
+  if (prefs.category) rows = rows.filter((t) => t.category_ids.includes(prefs.category));
   rows = rows.filter((t) => matches(`${t.title}\n${t.notes}\n${(t.subtasks || []).map((s) => s.title).join('\n')}`));
 
   const due = (t) => (t.due_at ? Date.parse(t.due_at) : Infinity);
@@ -242,7 +280,7 @@ function visibleTasks() {
 
 function visibleNotes() {
   let rows = store.list('notes');
-  if (prefs.category) rows = rows.filter((n) => n.category_id === prefs.category);
+  if (prefs.category) rows = rows.filter((n) => n.category_ids.includes(prefs.category));
   rows = rows.filter((n) => matches(`${n.title}\n${n.body}`));
   return rows.sort((a, b) => Number(b.pinned) - Number(a.pinned) || Date.parse(b.updated_at) - Date.parse(a.updated_at));
 }
@@ -340,8 +378,10 @@ function renderBar() {
 
 // ---------- lists ----------
 
+const categoriesOf = (row) => (row.category_ids || []).map(category).filter(Boolean);
+const catTags = (row) => categoriesOf(row).map((c) => `<span class="cat"><i class="dot" style="background:${esc(c.color)}"></i>${esc(c.name)}</span>`).join('');
+
 function taskRow(t) {
-  const cat = category(t.category_id);
   const subs = t.subtasks || [];
   const done = subs.filter((s) => s.done).length;
   const next = STATUS[NEXT_STATUS[t.status]].toLowerCase();
@@ -355,7 +395,7 @@ function taskRow(t) {
           ${t.due_at ? `<span class="due ${dueClass(t)}">${esc(dueLabel(t))}</span>` : ''}
           ${t.status === 'started' ? '<span class="tag-started">Started</span>' : ''}
           ${t.priority ? `<span class="pri pri-${t.priority}" title="${PRIORITY[t.priority]} priority"><i></i><i></i><i></i><span>${PRIORITY[t.priority]}</span></span>` : ''}
-          ${cat ? `<span class="cat"><i class="dot" style="background:${esc(cat.color)}"></i>${esc(cat.name)}</span>` : ''}
+          ${catTags(t)}
           ${subs.length ? `<span>${done}/${subs.length} steps</span>` : ''}
         </span>
       </button>
@@ -399,14 +439,13 @@ function renderNotes() {
   const rows = visibleNotes();
   if (!rows.length) { el.list.innerHTML = `<p class="empty">${emptyState()}</p>`; return; }
   el.list.innerHTML = `<ul class="notes">${rows.map((n) => {
-    const cat = category(n.category_id);
     const selected = ui.sel?.kind === 'notes' && ui.sel.id === n.id;
     return `
       <li class="note${selected ? ' selected' : ''}" data-id="${n.id}">
         <button class="note-open" data-act="open-note">
           <span class="note-title">${n.pinned ? `<span class="pinned" title="Pinned">${ICON.pin}</span>` : ''}${n.title ? esc(n.title) : '<em>Untitled note</em>'}</span>
           <span class="note-body">${esc(n.body.slice(0, 220))}</span>
-          <span class="task-meta"><span>Edited ${esc(shortDate(n.updated_at))}</span>${cat ? `<span class="cat"><i class="dot" style="background:${esc(cat.color)}"></i>${esc(cat.name)}</span>` : ''}</span>
+          <span class="task-meta"><span>Edited ${esc(shortDate(n.updated_at))}</span>${catTags(n)}</span>
         </button>
       </li>`;
   }).join('')}</ul>`;
@@ -420,10 +459,70 @@ const selected = () => (ui.sel?.draft ? ui.draft : ui.sel ? store.get(ui.sel.kin
 const isDraft = (row) => Boolean(row) && row === ui.draft;
 // Saves an edit made in the detail pane. A task that has not been created yet only lives in ui.draft.
 function commit(kind, row) { if (!isDraft(row)) store.save(kind, row); }
-const categoryOptions = (current) =>
-  `<option value="">No category</option>` +
-  store.list('categories').sort((a, b) => a.name.localeCompare(b.name))
-    .map((c) => `<option value="${c.id}" ${c.id === current ? 'selected' : ''}>${esc(c.name)}</option>`).join('');
+function categoryChips(row) {
+  const cats = store.list('categories').sort((a, b) => a.name.localeCompare(b.name));
+  if (!cats.length) return '<span class="hint">No categories yet. Add one from the menu.</span>';
+  return cats.map((c) => `<button type="button" class="chip" data-act="toggle-cat" data-value="${c.id}" aria-pressed="${row.category_ids.includes(c.id)}"><i class="dot" style="background:${esc(c.color)}"></i>${esc(c.name)}</button>`).join('');
+}
+
+function reminderAddArea(t) {
+  const mode = ui.remAdd?.id === t.id ? ui.remAdd.mode : null;
+  return `
+    <select data-field="rem-add" aria-label="Add a reminder"></select>
+    ${mode === 'custom' ? `
+    <div class="rem-new">
+      <input type="number" inputmode="numeric" min="1" max="999" step="1" value="${ui.remAdd.amount ?? 3}" data-field="rem-amount" aria-label="How many">
+      <select data-field="rem-unit" aria-label="Unit">
+        ${[['1', 'minutes'], ['60', 'hours'], ['1440', 'days'], ['10080', 'weeks']].map(([v, l]) => `<option value="${v}" ${String(ui.remAdd.unit ?? 60) === v ? 'selected' : ''}>${l}</option>`).join('')}
+      </select>
+      <span>before the deadline</span>
+      <button type="button" class="btn small primary" data-act="rem-add-custom">Add</button>
+      <button type="button" class="link" data-act="rem-cancel">Cancel</button>
+    </div>` : ''}
+    ${mode === 'exact' ? `
+    <div class="rem-new">
+      <button type="button" class="date-btn" data-act="pick-date" data-target="remind" aria-expanded="${calOpen(t, 'remind')}">${ICON.calendar}<span data-date-label="remind">${esc(fmtFullDate.format(new Date(`${ui.remAdd.date}T12:00`)))}</span></button>
+      <input type="time" data-field="rem-time" aria-label="Reminder time" value="${esc(ui.remAdd.time || '09:00')}">
+      <button type="button" class="btn small primary" data-act="rem-add-exact">Add</button>
+      <button type="button" class="link" data-act="rem-cancel">Cancel</button>
+    </div>
+    <div data-cal="remind">${calOpen(t, 'remind') ? calendarHtml(calSelected(t, 'remind')) : ''}</div>` : ''}`;
+}
+
+// The list of reminders, the "Add a reminder" menu and the hint below them.
+function renderReminders(t) {
+  const times = store.remindTimes(t);
+  const whenOf = (r) => {
+    if (r.at) return new Date(r.at);
+    if (!t.due_at) return null;
+    const base = new Date(t.due_at);
+    if (t.due_all_day) base.setHours(9, 0, 0, 0);
+    return new Date(base.getTime() - r.minutes * 60000);
+  };
+  const rows = (t.reminders || []).map((r) => ({ r, when: whenOf(r) }))
+    .sort((a, b) => (a.when ? a.when.getTime() : Infinity) - (b.when ? b.when.getTime() : Infinity));
+  $('[data-rems]', el.pane).innerHTML = rows.map(({ r, when }) => {
+    const note = !when ? 'needs a deadline' : when < new Date() ? 'passed' : r.at ? '' : `${dayDiff(when) === 0 ? 'today' : shortDate(when)} at ${fmtTime.format(when)}`;
+    return `<li class="rem${when && when < new Date() ? ' past' : ''}"><span>${esc(reminderLabel(r))}</span>${note ? `<span class="rem-when">${esc(note)}</span>` : ''}<button type="button" class="icon small" data-act="rem-remove" data-value="${r.id}" aria-label="Remove reminder ${esc(reminderLabel(r))}">${ICON.close}</button></li>`;
+  }).join('');
+
+  const has = (m) => (t.reminders || []).some((r) => !r.at && r.minutes === m);
+  $('[data-field="rem-add"]', el.pane).innerHTML = `
+    <option value="">${t.reminders?.length ? 'Add another reminder…' : 'Add a reminder…'}</option>
+    <optgroup label="Before the deadline">
+      ${REMINDERS.map(([v, l]) => `<option value="${v}" ${has(v) ? 'disabled' : ''}>${l}</option>`).join('')}
+      <option value="custom">Other amount…</option>
+    </optgroup>
+    <option value="exact">At a date and time…</option>`;
+
+  let hint = '';
+  if (t.reminders?.length) {
+    if (ui.push !== 'on') hint = 'Notifications are off on this device. Turn them on in Settings.';
+    else if (t.status === 'completed') hint = 'Completed tasks do not send reminders.';
+    else if (times.length && t.due_all_day && t.reminders.some((r) => !r.at)) hint = 'Deadlines without a time count from 09:00.';
+  }
+  $('[data-hint="remind"]', el.pane).textContent = hint;
+}
 
 let pendingSave = null;
 const saveTimer = debounce(() => flushSave(), 350);
@@ -453,7 +552,7 @@ function startDraft(fields) {
   if (ui.sel?.draft) discardDraft(false);
   flushSave();
   ui.draft = { ...store.DEFAULTS.tasks(), id: store.uid(), created_at: store.nowIso(), deleted: false, ...fields };
-  ui.draft._auto = applyCategoryDefaults(ui.draft, ui.draft.category_id);
+  ui.draft._auto = applyCategoryDefaults(ui.draft, ui.draft.category_ids);
   ui.sel = { kind: 'tasks', id: ui.draft.id, draft: true };
   renderPane(); renderList();
   const title = $('.title-input', el.pane);
@@ -477,7 +576,7 @@ function discardDraft(offerUndo = true) {
   const d = ui.draft;
   ui.draft = null; ui.sel = null;
   renderPane(); renderList();
-  const hasContent = d && (d.title.trim() || d.notes.trim() || d.subtasks.length || d.due_at);
+  const hasContent = d && (d.title.trim() || d.notes.trim() || d.subtasks.length || d.due_at || d.reminders.length);
   if (offerUndo && hasContent) {
     toast('New task discarded.', { label: 'Undo', run: () => { ui.draft = d; ui.sel = { kind: 'tasks', id: d.id, draft: true }; renderPane(); } });
   }
@@ -558,25 +657,23 @@ function taskPane(t) {
 
       <div class="field"><span class="label">Deadline</span>
         <div class="row">
-          <button type="button" class="date-btn" data-act="pick-date" aria-expanded="${ui.cal?.id === t.id}">${ICON.calendar}<span data-date-label>${d ? esc(fmtFullDate.format(d)) : 'Choose a date'}</span></button>
+          <button type="button" class="date-btn" data-act="pick-date" data-target="due" aria-expanded="${calOpen(t, 'due')}">${ICON.calendar}<span data-date-label="due">${d ? esc(fmtFullDate.format(d)) : 'Choose a date'}</span></button>
           <input type="hidden" data-field="due-date" value="${d ? localDate(d) : ''}">
           <input type="time" data-field="due-time" aria-label="Deadline time (optional)" value="${d && !t.due_all_day ? localTime(d) : ''}">
           <button class="link" data-act="clear-due">Clear</button>
         </div>
-        <div data-cal>${ui.cal?.id === t.id ? calendarHtml(t) : ''}</div>
+        <div data-cal="due">${calOpen(t, 'due') ? calendarHtml(calSelected(t, 'due')) : ''}</div>
       </div>
 
-      <label class="field"><span class="label">Reminder</span>
-        <select data-field="remind">
-          <option value="">No reminder</option>
-          ${REMINDERS.map(([v, l]) => `<option value="${v}" ${t.remind_offset === v ? 'selected' : ''}>${l}</option>`).join('')}
-        </select>
+      <div class="field"><span class="label">Reminders</span>
+        <ul class="rems" data-rems></ul>
+        <div class="rem-add">${reminderAddArea(t)}</div>
         <span class="hint" data-hint="remind"></span>
-      </label>
+      </div>
 
-      <label class="field"><span class="label">Category</span>
-        <select data-field="category">${categoryOptions(t.category_id)}</select>
-      </label>
+      <div class="field"><span class="label">Categories</span>
+        <div class="chips">${categoryChips(t)}</div>
+      </div>
 
       <div class="field"><span class="label">Steps</span>
         <ul class="subs"></ul>
@@ -605,15 +702,7 @@ function paneState(t) {
   const hasDue = Boolean(t.due_at);
   $('[data-field="due-time"]', el.pane).disabled = !hasDue;
   $('[data-act="clear-due"]', el.pane).hidden = !hasDue;
-  $('[data-field="remind"]', el.pane).disabled = !hasDue;
-
-  const hint = $('[data-hint="remind"]', el.pane);
-  if (!hasDue) hint.textContent = t.remind_offset != null ? 'The reminder starts once the task has a deadline.' : 'Set a deadline first.';
-  else if (t.remind_offset == null) hint.textContent = '';
-  else if (ui.push !== 'on') hint.textContent = 'Notifications are off on this device. Turn them on in Settings.';
-  else if (t.status === 'completed') hint.textContent = 'Completed tasks do not send reminders.';
-  else if (new Date(t.remind_at) < new Date()) hint.textContent = 'That time has already passed.';
-  else hint.textContent = `You will be reminded ${dayDiff(t.remind_at) === 0 ? 'today' : 'on ' + shortDate(t.remind_at)} at ${fmtTime.format(new Date(t.remind_at))}.` + (t.due_all_day ? ' Deadlines without a time count from 09:00.' : '');
+  renderReminders(t);
 
   if (isDraft(t)) { $('[data-stamps]', el.pane).textContent = 'Nothing is saved until you choose “Create task”.'; renderSubs(t); return; }
   const stamps = [`Created ${shortDate(t.created_at)}`];
@@ -639,10 +728,8 @@ function notePane(n) {
     ${paneHead('Note')}
     <div class="pane-body note-pane">
       <textarea class="title-input" data-field="title" data-grow rows="1" placeholder="Note title" aria-label="Note title" maxlength="300">${esc(n.title)}</textarea>
-      <div class="row">
-        <label class="field grow"><span class="sr">Category</span>
-          <select data-field="category">${categoryOptions(n.category_id)}</select>
-        </label>
+      <div class="row note-tools">
+        <div class="chips grow" role="group" aria-label="Categories">${categoryChips(n)}</div>
         <button class="btn" data-act="pin" aria-pressed="${n.pinned}">${ICON.pin}<span>${n.pinned ? 'Pinned' : 'Pin'}</span></button>
       </div>
       <textarea class="note-input" data-field="body" placeholder="Write your note" aria-label="Note text">${esc(n.body)}</textarea>
@@ -767,12 +854,20 @@ function defaultsPanel(c) {
       <div class="field"><span class="label">Time (optional)</span>
         <div class="row"><input type="time" data-cat-def="time" aria-label="Deadline time" value="${esc(c.def_due_time || '')}">${c.def_due_time ? '<button class="link" data-act="cat-def-no-time">No time</button>' : ''}</div>
       </div>` : ''}
-      <label class="field"><span class="label">Reminder</span>
-        <select data-cat-def="remind">
-          <option value="">No reminder</option>
-          ${REMINDERS.map(([v, l]) => `<option value="${v}" ${c.def_remind_offset === v ? 'selected' : ''}>${l}</option>`).join('')}
-        </select>
-      </label>
+      <div class="field"><span class="label">Reminders (before the deadline; choose any number)</span>
+        <div class="chips">
+          ${[...new Set([...REMINDERS.map(([v]) => v), ...(c.def_reminders || [])])].sort((a, b) => a - b)
+            .map((m) => `<button type="button" class="chip" data-act="cat-def-rem" data-value="${m}" aria-pressed="${(c.def_reminders || []).includes(m)}">${esc(offsetLabel(m))}</button>`).join('')}
+        </div>
+        <div class="rem-new">
+          <input type="number" inputmode="numeric" min="1" max="999" step="1" value="3" data-cat-def="rem-amount" aria-label="How many">
+          <select data-cat-def="rem-unit" aria-label="Unit">
+            ${[['1', 'minutes'], ['60', 'hours'], ['1440', 'days'], ['10080', 'weeks']].map(([v, l]) => `<option value="${v}" ${v === '60' ? 'selected' : ''}>${l}</option>`).join('')}
+          </select>
+          <span>before</span>
+          <button type="button" class="btn small" data-act="cat-def-rem-add">Add</button>
+        </div>
+      </div>
       ${defaultsSummary(c) ? `<p class="hint">${esc(defaultsSummary(c))}</p>` : ''}
     </div>`;
 }
@@ -869,7 +964,7 @@ const ACTIONS = {
   'open-note': (b) => open('notes', b.closest('[data-id]').dataset.id),
   'new-task-details': () => {
     const input = $('.quick input');
-    const fields = { title: input?.value.trim() || '', category_id: prefs.category };
+    const fields = { title: input?.value.trim() || '', category_ids: prefs.category ? [prefs.category] : [] };
     if (prefs.view === 'today') setDue(fields, localDate(new Date()), '');
     if (prefs.view === 'started') setStatus(fields, 'started');
     if (input) input.value = '';
@@ -877,7 +972,7 @@ const ACTIONS = {
   },
   'create-draft': () => createDraft(),
   'new-note': () => {
-    const n = store.create('notes', { category_id: prefs.category });
+    const n = store.create('notes', { category_ids: prefs.category ? [prefs.category] : [] });
     open('notes', n.id);
     $('.title-input', el.pane)?.focus();
   },
@@ -897,11 +992,51 @@ const ACTIONS = {
     ui.cal = null;
     commit('tasks', t); paneState(t); renderCalendar();
   },
-  'pick-date': () => {
+  'toggle-cat': (b) => {
+    const row = selected();
+    const kind = ui.sel.kind;
+    const id = b.dataset.value;
+    const adding = !row.category_ids.includes(id);
+    row.category_ids = adding ? [...row.category_ids, id] : row.category_ids.filter((x) => x !== id);
+    if (kind === 'tasks' && isDraft(row)) { swapDraftCategory(row); renderPane(); return; }
+    let filled = null;
+    if (kind === 'tasks' && adding) filled = filledText(applyCategoryDefaults(row, [id]));
+    commit(kind, row);
+    renderPane();
+    if (filled) toast(`Added from ${category(id).name}: ${filled}.`);
+  },
+  'rem-remove': (b) => {
     const t = selected();
-    if (ui.cal?.id === t.id) { closeCalendar(); return; }
-    const d = t.due_at ? new Date(t.due_at) : new Date();
-    ui.cal = { id: t.id, y: d.getFullYear(), m: d.getMonth() };
+    t.reminders = t.reminders.filter((r) => r.id !== b.dataset.value);
+    commit('tasks', t); renderReminders(t);
+  },
+  'rem-cancel': () => { ui.remAdd = null; ui.cal = null; renderPane(); },
+  'rem-add-custom': () => {
+    const t = selected();
+    const n = Math.round(Number($('[data-field="rem-amount"]', el.pane).value));
+    const unit = Number($('[data-field="rem-unit"]', el.pane).value);
+    if (!Number.isFinite(n) || n < 1) { toast('Enter how long before the deadline, for example 3.'); return; }
+    const minutes = Math.min(n * unit, 366 * 1440);
+    if (!addReminder(t, { minutes })) { toast('That reminder is already there.'); return; }
+    ui.remAdd = null;
+    commit('tasks', t); renderPane();
+  },
+  'rem-add-exact': () => {
+    const t = selected();
+    const time = $('[data-field="rem-time"]', el.pane).value || '09:00';
+    const at = new Date(`${ui.remAdd.date}T${time}`);
+    if (at < new Date()) { toast('That time has already passed. Choose a later one.'); return; }
+    if (!addReminder(t, { at: at.toISOString() })) { toast('That reminder is already there.'); return; }
+    ui.remAdd = null; ui.cal = null;
+    commit('tasks', t); renderPane();
+  },
+  'pick-date': (b) => {
+    const t = selected();
+    const target = b.dataset.target || 'due';
+    if (calOpen(t, target)) { closeCalendar(); return; }
+    const from = calSelected(t, target);
+    const d = from ? new Date(`${from}T12:00`) : new Date();
+    ui.cal = { id: t.id, target, y: d.getFullYear(), m: d.getMonth() };
     renderCalendar();
   },
   'cal-move': (b) => {
@@ -912,12 +1047,18 @@ const ACTIONS = {
   },
   'cal-day': (b) => {
     const t = selected();
+    if (b.closest('[data-cal]')?.dataset.cal === 'remind') {
+      ui.remAdd.date = b.dataset.value;
+      ui.cal = null; renderCalendar();
+      $('[data-act="pick-date"][data-target="remind"]', el.pane)?.focus();
+      return;
+    }
     $('[data-field="due-date"]', el.pane).value = b.dataset.value;
     touched(t, 'deadline');
     setDue(t, b.dataset.value, $('[data-field="due-time"]', el.pane).value);
     ui.cal = null;
     commit('tasks', t); paneState(t); renderCalendar();
-    $('[data-act="pick-date"]', el.pane)?.focus();
+    $('[data-act="pick-date"][data-target="due"]', el.pane)?.focus();
   },
   'remove-sub': (b) => {
     const t = selected(); const id = b.closest('.sub').dataset.sub;
@@ -979,6 +1120,22 @@ const ACTIONS = {
     const c = store.get('categories', b.closest('[data-cat-id]').dataset.catId);
     c.def_priority = Number(b.dataset.value) || null; store.save('categories', c); renderSettings();
   },
+  'cat-def-rem': (b) => {
+    const c = store.get('categories', b.closest('[data-cat-id]').dataset.catId);
+    const m = Number(b.dataset.value);
+    const list = c.def_reminders || [];
+    c.def_reminders = list.includes(m) ? list.filter((x) => x !== m) : [...list, m];
+    store.save('categories', c); renderSettings();
+  },
+  'cat-def-rem-add': (b) => {
+    const li = b.closest('[data-cat-id]');
+    const c = store.get('categories', li.dataset.catId);
+    const n = Math.round(Number($('[data-cat-def="rem-amount"]', li).value));
+    if (!Number.isFinite(n) || n < 1) { toast('Enter how long before the deadline, for example 3.'); return; }
+    const m = Math.min(n * Number($('[data-cat-def="rem-unit"]', li).value), 366 * 1440);
+    if (!(c.def_reminders || []).includes(m)) c.def_reminders = [...(c.def_reminders || []), m];
+    store.save('categories', c); renderSettings();
+  },
   'cat-def-no-time': (b) => {
     const c = store.get('categories', b.closest('[data-cat-id]').dataset.catId);
     c.def_due_time = null; store.save('categories', c); renderSettings();
@@ -995,7 +1152,7 @@ const ACTIONS = {
     const id = b.closest('[data-cat-id]').dataset.catId;
     // Tasks and notes keep existing; they just lose the label.
     for (const kind of ['tasks', 'notes']) {
-      store.list(kind).filter((r) => r.category_id === id).forEach((r) => { r.category_id = null; store.save(kind, r); });
+      store.list(kind).filter((r) => r.category_ids.includes(id)).forEach((r) => { r.category_ids = r.category_ids.filter((x) => x !== id); store.save(kind, r); });
     }
     store.remove('categories', id);
     if (prefs.category === id) { prefs.category = null; savePrefs(); }
@@ -1034,10 +1191,10 @@ document.addEventListener('submit', (e) => {
   const value = input.value.trim();
   if (!value) return;
   if (form.dataset.form === 'quick-add') {
-    const fields = { title: value, category_id: prefs.category };
+    const fields = { title: value, category_ids: prefs.category ? [prefs.category] : [] };
     if (prefs.view === 'today') setDue(fields, localDate(new Date()), '');
     if (prefs.view === 'started') setStatus(fields, 'started');
-    applyCategoryDefaults(fields, fields.category_id);
+    applyCategoryDefaults(fields, fields.category_ids);
     store.create('tasks', fields);
     input.value = '';
   } else if (form.dataset.form === 'add-category') {
@@ -1085,7 +1242,7 @@ function onField(e) {
       }
       case 'weekday': c.def_due_weekday = Number(v); break;
       case 'time': if (e.type !== 'change') return; c.def_due_time = v || null; break;
-      case 'remind': c.def_remind_offset = v === '' ? null : Number(v); break;
+      case 'rem-amount': case 'rem-unit': return; // read when "Add" is pressed
     }
     flushSave();
     store.save('categories', c);
@@ -1117,20 +1274,24 @@ function onField(e) {
     case 'title': row.title = target.value.replace(/\n/g, ' '); grow(target); saveSoon(kind, row.id); break;
     case 'notes': row.notes = target.value; grow(target); saveSoon(kind, row.id); break;
     case 'body': row.body = target.value; saveSoon(kind, row.id); break;
-    case 'category': {
-      row.category_id = target.value || null;
-      if (kind !== 'tasks') { commit(kind, row); break; }
-      if (isDraft(row)) { swapDraftCategory(row); renderPane(); break; }
-      const filled = applyCategoryDefaults(row, row.category_id);
-      commit(kind, row);
-      if (filled.length) { renderPane(); toast(`Filled in from ${category(row.category_id).name}: ${filled.join(', ')}.`); }
+    case 'rem-add': {
+      const v = target.value;
+      if (!v) break;
+      if (v === 'custom') ui.remAdd = { id: row.id, mode: 'custom' };
+      else if (v === 'exact') {
+        const base = row.due_at ? new Date(row.due_at) : new Date();
+        ui.remAdd = { id: row.id, mode: 'exact', date: localDate(base), time: row.due_at && !row.due_all_day ? localTime(new Date(new Date(row.due_at) - 36e5)) : '09:00' };
+      } else {
+        ui.remAdd = null;
+        addReminder(row, { minutes: Number(v) });
+        commit(kind, row);
+      }
+      renderPane();
       break;
     }
-    case 'remind':
-      touched(row, 'reminder');
-      row.remind_offset = target.value === '' ? null : Number(target.value);
-      row.remind_at = remindAt(row);
-      commit(kind, row); paneState(row); break;
+    case 'rem-amount': if (ui.remAdd) ui.remAdd.amount = target.value; break;
+    case 'rem-unit': if (ui.remAdd) ui.remAdd.unit = target.value; break;
+    case 'rem-time': if (ui.remAdd) ui.remAdd.time = target.value; break;
     case 'due-date':
     case 'due-time':
       if (e.type !== 'change') return;
@@ -1144,7 +1305,7 @@ document.addEventListener('change', (e) => { if (/^(date|time|color|number)$/.te
 
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape' && !el.settings.open) {
-    if (ui.cal) { closeCalendar(); $('[data-act="pick-date"]', el.pane)?.focus(); }
+    if (ui.cal) { const target = ui.cal.target; closeCalendar(); $(`[data-act="pick-date"][data-target="${target}"]`, el.pane)?.focus(); }
     else if (el.nav.classList.contains('open')) setNavOpen(false);
     else if (ui.sel) closePane();
   }

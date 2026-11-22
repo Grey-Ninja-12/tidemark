@@ -184,7 +184,7 @@ function stopListening() {
 
 function friendly(e) {
   const m = e?.message || String(e);
-  if (/def_(priority|due|remind)|PGRST204/i.test(m)) return 'The database needs an update for category defaults. Run supabase/schema.sql again in the Supabase SQL Editor.';
+  if (/category_ids|remind_times|'reminders'|def_reminders|def_(priority|due|remind)|PGRST204/i.test(m)) return 'The database needs an update. Run supabase/schema.sql again in the Supabase SQL Editor.';
   if (/relation .* does not exist|schema cache|PGRST205/i.test(m)) return 'The database tables are missing. Run supabase/schema.sql in your Supabase project.';
   if (/JWT|401|Invalid API key|apikey/i.test(m)) return 'Supabase rejected the key in config.js, or your sign-in has expired.';
   if (/Failed to fetch|NetworkError|Load failed/i.test(m)) return 'Could not reach Supabase. If you have not used the app for a week, the free project may be paused: restore it in the Supabase dashboard.';
